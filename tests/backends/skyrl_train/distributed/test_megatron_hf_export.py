@@ -1,0 +1,385 @@
+"""CPU unit tests for Megatron HF LoRA export (`merged`, `adapter`, `both`).
+
+Exercises `MegatronStrategy.save_hf_model` and `MegatronWorker.save_hf_model`
+without GPUs or distributed init, and validates `save_hf_adapter` call kwargs
+against the pinned `AutoBridge.save_hf_adapter` signature.
+"""
+
+import os
+from types import SimpleNamespace
+from unittest.mock import Mock, create_autospec
+
+import pytest
+
+from skyrl.train.config import MegatronHFExportConfig
+
+pytestmark = pytest.mark.megatron
+
+try:
+    from megatron.bridge import AutoBridge
+
+    from skyrl.backends.skyrl_train.distributed.megatron import (
+        megatron_strategy as strategy_mod,
+    )
+    from skyrl.backends.skyrl_train.workers.megatron import (
+        megatron_worker as worker_mod,
+    )
+except ModuleNotFoundError as e:
+    if not e.name or (e.name != "megatron" and not e.name.startswith("megatron.")):
+        raise
+    pytest.skip(f"megatron unavailable: {e}", allow_module_level=True)
+
+
+def _make_strategy(*, is_lora: bool = True, is_rank_0: bool = True):
+    owner = strategy_mod.MegatronStrategy.__new__(strategy_mod.MegatronStrategy)
+    owner.is_lora = is_lora
+    owner.hf_config = Mock()
+    owner.is_rank_0 = Mock(return_value=is_rank_0)
+    owner.save_hf_configs = Mock()
+    owner.print = Mock()
+    return owner
+
+
+def _make_bridge():
+    # Autospec against the pinned AutoBridge.save_hf_adapter / save_hf_weights
+    # so signature drift fails on CPU.
+    save_hf_adapter = create_autospec(AutoBridge.save_hf_adapter, return_value=None)
+    save_hf_weights = create_autospec(AutoBridge.save_hf_weights, return_value=None)
+
+    bridge = SimpleNamespace(
+        hf_pretrained=SimpleNamespace(save_artifacts=Mock()),
+    )
+    bridge.save_hf_adapter = lambda *args, **kwargs: save_hf_adapter(bridge, *args, **kwargs)
+    bridge.save_hf_weights = lambda *args, **kwargs: save_hf_weights(bridge, *args, **kwargs)
+    return bridge, save_hf_adapter, save_hf_weights
+
+
+def test_megatron_strategy_save_hf_model_merged_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(strategy_mod.dist, "barrier", Mock())
+    owner = _make_strategy(is_lora=True, is_rank_0=True)
+    bridge, save_adapter, save_weights = _make_bridge()
+    model = SimpleNamespace(actor_module=["chunk0"])
+    tokenizer = Mock()
+    out_dir = str(tmp_path / "policy")
+
+    owner.save_hf_model(
+        bridge,
+        model,
+        out_dir,
+        tokenizer=tokenizer,
+        distributed_save=True,
+        save_every_n_ranks=2,
+        lora_export_format="merged",
+        peft_config=Mock(),
+    )
+
+    save_weights.assert_called_once_with(
+        bridge,
+        ["chunk0"],
+        out_dir,
+        strict=False,
+        distributed_save=True,
+        save_every_n_ranks=2,
+    )
+    bridge.hf_pretrained.save_artifacts.assert_called_once_with(out_dir)
+    owner.save_hf_configs.assert_called_once_with(owner.hf_config, out_dir, tokenizer)
+    save_adapter.assert_not_called()
+    tokenizer.save_pretrained.assert_not_called()
+
+
+def test_megatron_strategy_save_hf_model_adapter_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(strategy_mod.dist, "barrier", Mock())
+    owner = _make_strategy(is_lora=True, is_rank_0=True)
+    bridge, save_adapter, save_weights = _make_bridge()
+    model = SimpleNamespace(actor_module=["chunk0"])
+    peft_config = Mock()
+    tokenizer = Mock()
+    out_dir = str(tmp_path / "policy")
+
+    owner.save_hf_model(
+        bridge,
+        model,
+        out_dir,
+        tokenizer=tokenizer,
+        lora_export_format="adapter",
+        peft_config=peft_config,
+        base_model_name_or_path="Qwen/Qwen3-8B",
+        expand_shared_outer=True,
+        allow_serving_layout=False,
+    )
+
+    save_weights.assert_not_called()
+    bridge.hf_pretrained.save_artifacts.assert_not_called()
+    owner.save_hf_configs.assert_not_called()
+    save_adapter.assert_called_once_with(
+        bridge,
+        ["chunk0"],
+        out_dir,
+        peft_config=peft_config,
+        base_model_name_or_path="Qwen/Qwen3-8B",
+        expand_shared_outer=True,
+        allow_serving_layout=False,
+    )
+    tokenizer.save_pretrained.assert_called_once_with(out_dir)
+
+
+def test_megatron_strategy_save_hf_model_both(tmp_path, monkeypatch):
+    monkeypatch.setattr(strategy_mod.dist, "barrier", Mock())
+    owner = _make_strategy(is_lora=True, is_rank_0=True)
+    bridge, save_adapter, save_weights = _make_bridge()
+    model = SimpleNamespace(actor_module=["chunk0"])
+    peft_config = Mock()
+    tokenizer = Mock()
+    out_dir = str(tmp_path / "policy")
+    expected_adapter_dir = os.path.join(out_dir, "lora_adapter")
+
+    owner.save_hf_model(
+        bridge,
+        model,
+        out_dir,
+        tokenizer=tokenizer,
+        lora_export_format="both",
+        peft_config=peft_config,
+        base_model_name_or_path="Qwen/Qwen3-8B",
+        allow_serving_layout=True,
+    )
+
+    save_weights.assert_called_once_with(
+        bridge,
+        ["chunk0"],
+        out_dir,
+        strict=False,
+        distributed_save=False,
+        save_every_n_ranks=1,
+    )
+    bridge.hf_pretrained.save_artifacts.assert_called_once_with(out_dir)
+    owner.save_hf_configs.assert_called_once_with(owner.hf_config, out_dir, tokenizer)
+    save_adapter.assert_called_once_with(
+        bridge,
+        ["chunk0"],
+        expected_adapter_dir,
+        peft_config=peft_config,
+        base_model_name_or_path="Qwen/Qwen3-8B",
+        expand_shared_outer=False,
+        allow_serving_layout=True,
+    )
+    tokenizer.save_pretrained.assert_called_once_with(expected_adapter_dir)
+
+
+def test_megatron_strategy_save_hf_model_non_rank0_skips_tokenizer_write(tmp_path, monkeypatch):
+    monkeypatch.setattr(strategy_mod.dist, "barrier", Mock())
+    monkeypatch.setattr(strategy_mod.dist, "is_initialized", Mock(return_value=True))
+    monkeypatch.setattr(strategy_mod.dist, "broadcast_object_list", Mock())
+    owner = _make_strategy(is_lora=True, is_rank_0=False)
+    bridge, save_adapter, _ = _make_bridge()
+    model = SimpleNamespace(actor_module=["chunk0"])
+    peft_config = Mock()
+    tokenizer = Mock()
+    out_dir = str(tmp_path / "policy")
+
+    owner.save_hf_model(
+        bridge,
+        model,
+        out_dir,
+        tokenizer=tokenizer,
+        lora_export_format="adapter",
+        peft_config=peft_config,
+    )
+
+    # All ranks must still participate in the collective bridge call.
+    save_adapter.assert_called_once()
+    tokenizer.save_pretrained.assert_not_called()
+
+
+def test_megatron_strategy_rank0_tokenizer_failure_propagates_to_all_ranks(tmp_path, monkeypatch):
+    barrier = Mock()
+    monkeypatch.setattr(strategy_mod.dist, "barrier", barrier)
+    monkeypatch.setattr(strategy_mod.dist, "is_initialized", Mock(return_value=True))
+
+    broadcast_payload = []
+
+    def _capture_broadcast(obj_list, src=0):
+        broadcast_payload.append(list(obj_list))
+
+    monkeypatch.setattr(strategy_mod.dist, "broadcast_object_list", _capture_broadcast)
+
+    owner_r0 = _make_strategy(is_lora=True, is_rank_0=True)
+    bridge, _, _ = _make_bridge()
+    model = SimpleNamespace(actor_module=["chunk0"])
+    tokenizer = Mock()
+    tokenizer.save_pretrained.side_effect = OSError("disk full")
+
+    with pytest.raises(OSError, match="disk full"):
+        owner_r0.save_hf_model(
+            bridge,
+            model,
+            str(tmp_path / "policy"),
+            tokenizer=tokenizer,
+            lora_export_format="adapter",
+            peft_config=Mock(),
+        )
+    assert broadcast_payload == [["OSError: disk full"]]
+    # Must raise before the trailing barrier so ranks do not hang.
+    assert barrier.call_count == 1
+
+    # Non-rank-0 receives the broadcast error status even if tokenizer=None locally.
+    def _deliver_error(obj_list, src=0):
+        obj_list[0] = "OSError: disk full"
+
+    monkeypatch.setattr(strategy_mod.dist, "broadcast_object_list", _deliver_error)
+    owner_r1 = _make_strategy(is_lora=True, is_rank_0=False)
+    with pytest.raises(RuntimeError, match="Rank 0 failed to save tokenizer.*OSError: disk full"):
+        owner_r1.save_hf_model(
+            bridge,
+            model,
+            str(tmp_path / "policy"),
+            tokenizer=None,
+            lora_export_format="adapter",
+            peft_config=Mock(),
+        )
+
+
+def test_megatron_strategy_both_mode_rank0_metadata_failure_aborts_before_adapter_export(tmp_path, monkeypatch):
+    monkeypatch.setattr(strategy_mod.dist, "barrier", Mock())
+    monkeypatch.setattr(strategy_mod.dist, "is_initialized", Mock(return_value=True))
+
+    def _deliver_error(obj_list, src=0):
+        obj_list[0] = "OSError: metadata write failed"
+
+    monkeypatch.setattr(strategy_mod.dist, "broadcast_object_list", _deliver_error)
+    owner_r1 = _make_strategy(is_lora=True, is_rank_0=False)
+    bridge, save_adapter, save_weights = _make_bridge()
+    model = SimpleNamespace(actor_module=["chunk0"])
+
+    with pytest.raises(RuntimeError, match="Rank 0 failed to save HF config and tokenizer.*metadata write failed"):
+        owner_r1.save_hf_model(
+            bridge,
+            model,
+            str(tmp_path / "policy"),
+            tokenizer=None,
+            lora_export_format="both",
+            peft_config=Mock(),
+        )
+
+    save_weights.assert_called_once()
+    save_adapter.assert_not_called()
+
+
+def test_megatron_strategy_adapter_only_allows_cloud_path_with_distributed_save(tmp_path, monkeypatch):
+    """Adapter export only writes from rank 0, so distributed_save=True must not block cloud paths."""
+    monkeypatch.setattr(strategy_mod.dist, "barrier", Mock())
+    monkeypatch.setattr(strategy_mod.io, "is_cloud_path", lambda p: p.startswith("s3://"))
+    monkeypatch.setattr(strategy_mod.io, "makedirs", Mock())
+
+    staged_dir = str(tmp_path / "staged")
+    os.makedirs(staged_dir)
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _fake_local_work_dir(_path):
+        yield staged_dir
+
+    monkeypatch.setattr(strategy_mod.io, "local_work_dir", _fake_local_work_dir)
+
+    owner = _make_strategy(is_lora=True, is_rank_0=True)
+    bridge, save_adapter, save_weights = _make_bridge()
+    model = SimpleNamespace(actor_module=["chunk0"])
+    peft_config = Mock()
+
+    owner.save_hf_model(
+        bridge,
+        model,
+        "s3://bucket/exports/step_1/policy",
+        tokenizer=None,
+        distributed_save=True,
+        lora_export_format="adapter",
+        peft_config=peft_config,
+    )
+
+    save_weights.assert_not_called()
+    save_adapter.assert_called_once_with(
+        bridge,
+        ["chunk0"],
+        staged_dir,
+        peft_config=peft_config,
+        base_model_name_or_path=None,
+        expand_shared_outer=False,
+        allow_serving_layout=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "is_lora, kwargs, match",
+    [
+        (True, {"lora_export_format": "unknown"}, "lora_export_format must be one of"),
+        (False, {"lora_export_format": "adapter", "peft_config": Mock()}, "requires a LoRA policy"),
+        (True, {"lora_export_format": "adapter", "peft_config": None}, "requires a LoRA policy"),
+        (
+            True,
+            {
+                "lora_export_format": "adapter",
+                "peft_config": Mock(),
+                "expand_shared_outer": True,
+                "allow_serving_layout": True,
+            },
+            "cannot both be True",
+        ),
+        (
+            True,
+            {"lora_export_format": "merged", "expand_shared_outer": True},
+            "require lora_export_format to be 'adapter' or 'both'",
+        ),
+    ],
+)
+def test_megatron_strategy_save_hf_model_rejects_invalid_args(tmp_path, is_lora, kwargs, match):
+    owner = _make_strategy(is_lora=is_lora, is_rank_0=True)
+    bridge, _, _ = _make_bridge()
+    model = SimpleNamespace(actor_module=["chunk0"])
+
+    with pytest.raises(ValueError, match=match):
+        owner.save_hf_model(bridge, model, str(tmp_path / "policy"), **kwargs)
+
+
+def test_megatron_worker_save_hf_model_forwards_adapter_export_config(monkeypatch):
+    monkeypatch.setattr(worker_mod, "sync_params_for_export", Mock())
+    strategy_save = Mock()
+    peft_config = Mock()
+    tokenizer = Mock()
+    bridge = Mock()
+    model = Mock()
+
+    worker = SimpleNamespace(
+        actor_module=["chunk0"],
+        optimizer=None,
+        bridge=bridge,
+        model=model,
+        lora_cls=peft_config,
+        _logical_model_path="Qwen/Qwen3-8B",
+        megatron_config=SimpleNamespace(
+            hf_export_config=MegatronHFExportConfig(
+                distributed_save=False,
+                save_every_n_ranks=1,
+                lora_export_format="both",
+                expand_shared_outer=True,
+                allow_serving_layout=False,
+            )
+        ),
+        strategy=SimpleNamespace(save_hf_model=strategy_save),
+    )
+
+    worker_mod.MegatronWorker.save_hf_model(worker, "/tmp/export/policy", tokenizer=tokenizer)
+
+    strategy_save.assert_called_once_with(
+        bridge,
+        model,
+        "/tmp/export/policy",
+        tokenizer=tokenizer,
+        distributed_save=False,
+        save_every_n_ranks=1,
+        lora_export_format="both",
+        peft_config=peft_config,
+        base_model_name_or_path="Qwen/Qwen3-8B",
+        expand_shared_outer=True,
+        allow_serving_layout=False,
+    )

@@ -1085,6 +1085,11 @@ class MegatronWorker:
             tokenizer=tokenizer,
             distributed_save=hf_export.distributed_save,
             save_every_n_ranks=hf_export.save_every_n_ranks,
+            lora_export_format=getattr(hf_export, "lora_export_format", "merged"),
+            peft_config=getattr(self, "lora_cls", None),
+            base_model_name_or_path=getattr(self, "_logical_model_path", None) or None,
+            expand_shared_outer=getattr(hf_export, "expand_shared_outer", False),
+            allow_serving_layout=getattr(hf_export, "allow_serving_layout", False),
         )
 
     def _get_module_for_offload(self):
