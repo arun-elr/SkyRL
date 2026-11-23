@@ -1245,9 +1245,16 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """
         with deadline.operation(endpoint):
             results = await asyncio.gather(
-                *[self._call_server(url, endpoint, json, method, params) for url in self.server_urls]
+                *[self._call_server(url, endpoint, json, method, params) for url in self.server_urls],
+                return_exceptions=True,
             )
-        return {url: resp for url, resp in results}
+        responses = {}
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            url, resp = result
+            responses[url] = resp
+        return responses
 
     async def pause(self, mode: Union[PauseMode, str] = PauseMode.KEEP, clear_cache: bool = False) -> Dict[str, Any]:
         """
@@ -1511,10 +1518,51 @@ class RemoteInferenceClient(InferenceEngineInterface):
         ``/collective_rpc``, and must land before the trainer calls
         ``send_weights()`` (see ``weight_sync/lora_target.py``).
         """
-        return await self._call_all_servers(
-            "/collective_rpc",
-            {"method": "skyrl_set_lora_receive_target", "kwargs": {"receive_target": receive_target}},
-        )
+        payload = {"method": "skyrl_set_lora_receive_target", "kwargs": {"receive_target": receive_target}}
+        with deadline.operation("/collective_rpc"):
+            fanout = asyncio.ensure_future(
+                asyncio.gather(
+                    *[self._call_server(url, "/collective_rpc", payload) for url in self.server_urls],
+                    return_exceptions=True,
+                )
+            )
+            cancelled = False
+            while not fanout.done():
+                try:
+                    await asyncio.wait({fanout})
+                except asyncio.CancelledError:
+                    cancelled = True
+            results = fanout.result()
+        responses: Dict[str, Any] = {}
+        first_error: Optional[BaseException] = None
+        for result in results:
+            if isinstance(result, BaseException):
+                if first_error is None:
+                    first_error = result
+            else:
+                url, resp = result
+                responses[url] = resp
+        if cancelled or first_error is not None:
+            # Disarm every contacted server (including any that timed out or
+            # failed after arming a subset of workers) so a subsequent tenant's
+            # set_lora_receive_target is not rejected as double-armed.
+            clear_payload = {"method": "skyrl_clear_lora_receive_target"}
+            clear_fanout = asyncio.ensure_future(
+                asyncio.gather(
+                    *[self._call_server(url, "/collective_rpc", clear_payload) for url in self.server_urls],
+                    return_exceptions=True,
+                )
+            )
+            while not clear_fanout.done():
+                try:
+                    await asyncio.wait({clear_fanout})
+                except asyncio.CancelledError:
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError() from first_error
+            assert first_error is not None
+            raise first_error
+        return responses
 
     async def load_lora_adapter(
         self,
@@ -1570,11 +1618,19 @@ class RemoteInferenceClient(InferenceEngineInterface):
                     raise_for_status(resp, body)
                 return server_url, {"status": resp.status, "body": await resp.text()}
 
-        results = await asyncio.gather(*[_load_on_server(url) for url in self.server_urls])
+        # Settle every server load before raising so none remain in flight on return.
+        results = await asyncio.gather(*[_load_on_server(url) for url in self.server_urls], return_exceptions=True)
+
+        responses = {}
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            url, resp = result
+            responses[url] = resp
 
         logger.info(f"Loaded LoRA adapter '{lora_name}' from {'staged GPU tensors' if in_memory else lora_path}")
 
-        return {url: resp for url, resp in results}
+        return responses
 
     async def unload_lora_adapter(self, lora_name: str) -> Dict[str, Any]:
         """

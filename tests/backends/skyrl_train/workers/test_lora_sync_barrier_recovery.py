@@ -1,0 +1,936 @@
+"""Tests for distributed barrier recovery during LoRA / weight sync failures.
+
+Covers issue #1827: when rank 0 (or a writer rank) raises inside
+``_save_lora_adapters_and_sync``, ``_publish_lora_adapter_in_memory``, or
+prefix-cache reset before a ``torch.distributed.barrier()``, peer ranks must
+not hang until Gloo times out and poisons the process group for subsequent
+multi-tenant ``save_weights_for_sampler`` requests.
+"""
+
+import asyncio
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import timedelta
+from enum import Enum
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+    RemoteInferenceClient,
+)
+from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
+from skyrl.backends.skyrl_train.workers.worker import PolicyWorkerBase
+from skyrl.backends.skyrl_train.workers.worker_utils import (
+    PeerRankSyncError,
+    barrier_with_error_propagation,
+    cleanup_unawaited_task,
+)
+
+
+class _FakeTaskType(Enum):
+    CAUSAL_LM = "CAUSAL_LM"
+
+
+class _FakePeftType(Enum):
+    LORA = "LORA"
+
+
+@dataclass
+class _FakePeftConfig:
+    r: int
+    lora_alpha: int
+    target_modules: tuple
+    task_type: _FakeTaskType
+    peft_type: _FakePeftType
+
+
+def _init_gloo_group(rank: int, world_size: int, store_path: str, timeout_s: float = 5.0) -> None:
+    store = dist.FileStore(store_path, world_size)
+    dist.init_process_group(
+        backend="gloo",
+        store=store,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=timeout_s),
+    )
+
+
+def _run_mp(fn, world_size: int, tmp_path: Path, *extra_args) -> None:
+    store_path = str(tmp_path / "dist_store")
+    mp.spawn(fn, args=(world_size, store_path, *extra_args), nprocs=world_size, join=True)
+
+
+# ---------------------------------------------------------------------------
+# Multi-rank Gloo tests: barrier_with_error_propagation
+# ---------------------------------------------------------------------------
+
+
+def _worker_barrier_rank0_failure_and_recovery(rank: int, world_size: int, store_path: str) -> None:
+    _init_gloo_group(rank, world_size, store_path)
+    try:
+        # Round 1: rank 0 fails with a connection error before the barrier.
+        local_error = RuntimeError("ClientConnectorError: Cannot connect to vLLM server") if rank == 0 else None
+        if rank == 0:
+            with pytest.raises(RuntimeError, match="Cannot connect to vLLM server"):
+                barrier_with_error_propagation(local_error, stage="LoRA adapter load")
+        else:
+            with pytest.raises(PeerRankSyncError, match=r"Rank 0 failed during LoRA adapter load"):
+                barrier_with_error_propagation(local_error, stage="LoRA adapter load")
+
+        # Rounds 2 and 3: process group must still be healthy (no pair closure / timeout).
+        barrier_with_error_propagation(None, stage="LoRA adapter load")
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_barrier_with_error_propagation_rank0_failure_and_recovery(tmp_path):
+    _run_mp(_worker_barrier_rank0_failure_and_recovery, 4, tmp_path)
+
+
+def _worker_barrier_nonzero_rank_failure(rank: int, world_size: int, store_path: str) -> None:
+    _init_gloo_group(rank, world_size, store_path)
+    try:
+        # Simulate a non-zero writer rank (e.g. second node leader) hitting disk full.
+        local_error = OSError("No space left on device") if rank == 2 else None
+        if rank == 2:
+            with pytest.raises(OSError, match="No space left on device"):
+                barrier_with_error_propagation(local_error, stage="LoRA adapter export")
+        else:
+            with pytest.raises(PeerRankSyncError, match=r"Rank 2 failed during LoRA adapter export"):
+                barrier_with_error_propagation(local_error, stage="LoRA adapter export")
+
+        # Subsequent sync succeeds across all 4 ranks.
+        barrier_with_error_propagation(None, stage="LoRA adapter export")
+    finally:
+        dist.destroy_process_group()
+
+
+def test_barrier_with_error_propagation_nonzero_rank_failure(tmp_path):
+    _run_mp(_worker_barrier_nonzero_rank_failure, 4, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Multi-rank Gloo tests: FSDP LoRA sync + prefix cache reset recovery
+# ---------------------------------------------------------------------------
+
+
+def _make_fsdp_lora_worker(base_sync_path: str) -> FSDPPolicyWorkerBase:
+    peft_cfg = _FakePeftConfig(
+        r=4,
+        lora_alpha=8,
+        target_modules=("q_proj",),
+        task_type=_FakeTaskType.CAUSAL_LM,
+        peft_type=_FakePeftType.LORA,
+    )
+    peft_model = SimpleNamespace(peft_config={"default": peft_cfg})
+    worker = FSDPPolicyWorkerBase.__new__(FSDPPolicyWorkerBase)
+    worker._is_lora = True
+    worker._is_multimodal_lm_only = False
+    worker._weight_sync_inference_client = None
+    worker.model = SimpleNamespace(model=peft_model)
+    worker.cfg = SimpleNamespace(
+        fully_async=SimpleNamespace(enabled=False, clear_kv_cache_on_weight_sync=False),
+        placement=SimpleNamespace(colocate_all=False),
+        policy=SimpleNamespace(
+            model=SimpleNamespace(lora=SimpleNamespace(lora_sync_path=base_sync_path)),
+        ),
+    )
+    return worker
+
+
+def _worker_fsdp_lora_load_failure_recovers(rank: int, world_size: int, store_path: str, sync_dir: str) -> None:
+    from skyrl.backends.skyrl_train.distributed import fsdp_utils
+
+    _init_gloo_group(rank, world_size, store_path)
+    orig_collect = fsdp_utils.collect_lora_params
+    orig_empty_cache = torch.cuda.empty_cache
+    try:
+        fsdp_utils.collect_lora_params = lambda module: {
+            "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(2, 4),
+            "base_model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.ones(4, 2),
+        }
+        torch.cuda.empty_cache = lambda: None
+
+        worker = _make_fsdp_lora_worker(sync_dir)
+        ie_cfg = SimpleNamespace(enable_prefix_caching=True)
+
+        loaded = []
+        resets = []
+
+        async def _load_lora(name: str, path: str):
+            if name == "tenant-a":
+                raise RuntimeError("Failed to load LoRA adapter 'tenant-a': ClientConnectorError")
+            loaded.append((name, path))
+
+        async def _reset_cache(reset_running_requests: bool = True):
+            resets.append(reset_running_requests)
+
+        client = Mock(spec=RemoteInferenceClient)
+        client.load_lora_adapter = AsyncMock(side_effect=_load_lora)
+        client.reset_prefix_cache = AsyncMock(side_effect=_reset_cache)
+
+        async def _run():
+            # Request 1 fails on rank 0 during load_lora_adapter; rank 1 must exit cleanly.
+            if rank == 0:
+                with pytest.raises(RuntimeError, match="ClientConnectorError"):
+                    await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-a")
+            else:
+                await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-a")
+
+            # Requests 2 & 3 for other tenants must succeed without barrier timeouts.
+            await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-b")
+            await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-c")
+
+        asyncio.run(_run())
+
+        if rank == 0:
+            assert [name for name, _ in loaded] == ["tenant-b", "tenant-c"]
+            assert len(resets) == 2
+            assert (Path(sync_dir) / "tenant-b" / "adapter_model.safetensors").exists()
+            assert (Path(sync_dir) / "tenant-c" / "adapter_model.safetensors").exists()
+        else:
+            assert loaded == []
+            assert resets == []
+    finally:
+        fsdp_utils.collect_lora_params = orig_collect
+        torch.cuda.empty_cache = orig_empty_cache
+        dist.destroy_process_group()
+
+
+def test_fsdp_lora_sync_load_failure_recovers_for_subsequent_tenants(tmp_path):
+    _run_mp(_worker_fsdp_lora_load_failure_recovers, 2, tmp_path, str(tmp_path / "lora_sync"))
+
+
+def _worker_fsdp_prefix_cache_reset_failure_recovers(
+    rank: int, world_size: int, store_path: str, sync_dir: str
+) -> None:
+    from skyrl.backends.skyrl_train.distributed import fsdp_utils
+
+    _init_gloo_group(rank, world_size, store_path)
+    orig_collect = fsdp_utils.collect_lora_params
+    orig_empty_cache = torch.cuda.empty_cache
+    try:
+        fsdp_utils.collect_lora_params = lambda module: {
+            "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(2, 4),
+        }
+        torch.cuda.empty_cache = lambda: None
+
+        worker = _make_fsdp_lora_worker(sync_dir)
+        ie_cfg = SimpleNamespace(enable_prefix_caching=True)
+
+        reset_attempts = 0
+
+        async def _reset_cache(reset_running_requests: bool = True):
+            nonlocal reset_attempts
+            reset_attempts += 1
+            if reset_attempts == 1:
+                raise RuntimeError("Prefix cache reset failed on http://vllm:8001")
+
+        client = Mock(spec=RemoteInferenceClient)
+        client.load_lora_adapter = AsyncMock()
+        client.reset_prefix_cache = AsyncMock(side_effect=_reset_cache)
+
+        async def _run():
+            if rank == 0:
+                with pytest.raises(RuntimeError, match="Prefix cache reset failed"):
+                    await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-a")
+            else:
+                await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-a")
+
+            await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-b")
+
+        asyncio.run(_run())
+        if rank == 0:
+            assert reset_attempts == 2
+    finally:
+        fsdp_utils.collect_lora_params = orig_collect
+        torch.cuda.empty_cache = orig_empty_cache
+        dist.destroy_process_group()
+
+
+def test_fsdp_lora_sync_prefix_cache_reset_failure_recovers(tmp_path):
+    _run_mp(_worker_fsdp_prefix_cache_reset_failure_recovers, 2, tmp_path, str(tmp_path / "lora_sync"))
+
+
+# ---------------------------------------------------------------------------
+# Multi-rank Gloo tests: Worker._sync_weights_to_inference_engines
+# ---------------------------------------------------------------------------
+
+
+def _worker_full_weight_sync_prefix_cache_failure_recovers(rank: int, world_size: int, store_path: str) -> None:
+    _init_gloo_group(rank, world_size, store_path)
+    orig_empty_cache = torch.cuda.empty_cache
+    try:
+        torch.cuda.empty_cache = lambda: None
+
+        class _Engine:
+            skyrl_handles_prefix_cache_reset = False
+            skyrl_force_disable_expandable_segments = False
+            skyrl_empty_cache_after_send = False
+
+            def __init__(self):
+                self.sends = 0
+
+            def send_weights(self):
+                self.sends += 1
+
+        worker = PolicyWorkerBase.__new__(PolicyWorkerBase)
+        worker._weight_sync_engine = _Engine()
+        worker.cfg = SimpleNamespace(
+            fully_async=SimpleNamespace(enabled=False, clear_kv_cache_on_weight_sync=False),
+            placement=SimpleNamespace(colocate_all=False),
+        )
+
+        @contextmanager
+        def _noop_ctx(*args, **kwargs):
+            yield
+
+        worker._expandable_segments_disabled_for_sync = _noop_ctx
+
+        reset_attempts = 0
+
+        async def _reset_cache(reset_running_requests: bool = True):
+            nonlocal reset_attempts
+            reset_attempts += 1
+            if reset_attempts == 1:
+                raise RuntimeError("vLLM unreachable during reset_prefix_cache")
+
+        client = Mock()
+        client.reset_prefix_cache = AsyncMock(side_effect=_reset_cache)
+        ie_cfg = SimpleNamespace(enable_prefix_caching=True)
+
+        async def _run():
+            if rank == 0:
+                with pytest.raises(RuntimeError, match="vLLM unreachable"):
+                    await worker._sync_weights_to_inference_engines(client, ie_cfg)
+            else:
+                await worker._sync_weights_to_inference_engines(client, ie_cfg)
+
+            await worker._sync_weights_to_inference_engines(client, ie_cfg)
+
+        asyncio.run(_run())
+        assert worker._weight_sync_engine.sends == 2
+    finally:
+        torch.cuda.empty_cache = orig_empty_cache
+        dist.destroy_process_group()
+
+
+@pytest.mark.vllm
+def test_sync_weights_prefix_cache_reset_failure_recovers(tmp_path):
+    _run_mp(_worker_full_weight_sync_prefix_cache_failure_recovers, 2, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Multi-rank Gloo tests: Megatron LoRA disk & in-memory sync recovery
+# ---------------------------------------------------------------------------
+
+
+def _make_megatron_lora_worker(base_sync_path: str, *, sync_mode: str = "disk"):
+    from skyrl.backends.skyrl_train.workers.megatron.megatron_worker import (
+        MegatronPolicyWorkerBase,
+    )
+
+    worker = MegatronPolicyWorkerBase.__new__(MegatronPolicyWorkerBase)
+    worker._is_lora = True
+    worker._weight_sync_inference_client = None
+    worker._weight_sync_engine = None
+    worker._lora_weight_source = None
+    worker._logical_model_path = "/models/base"
+    worker.actor_module = []
+    worker.provider = SimpleNamespace(num_moe_experts=None)
+    worker.lora_cls = SimpleNamespace(dim=4, alpha=8, target_modules=["q_proj"])
+    worker.bridge = SimpleNamespace(
+        hf_pretrained=SimpleNamespace(model_name_or_path="/models/base"),
+        export_adapter_weights=lambda actor_module, cpu=True, show_progress=False: [
+            ("layers.0.self_attn.q_proj.lora_A.weight", torch.ones(4, 8, dtype=torch.bfloat16)),
+            ("layers.0.self_attn.q_proj.lora_B.weight", torch.ones(8, 4, dtype=torch.bfloat16)),
+        ],
+        _model_bridge=SimpleNamespace(_adapter_target_modules=lambda names: ["q_proj"]),
+    )
+    worker.cfg = SimpleNamespace(
+        fully_async=SimpleNamespace(enabled=False, clear_kv_cache_on_weight_sync=False),
+        placement=SimpleNamespace(colocate_all=False),
+        policy=SimpleNamespace(
+            model=SimpleNamespace(lora=SimpleNamespace(lora_sync_path=base_sync_path, sync_mode=sync_mode)),
+            megatron_config=SimpleNamespace(lora_config=SimpleNamespace(merge_lora=False)),
+        ),
+    )
+
+    @contextmanager
+    def _noop_ctx(*args, **kwargs):
+        yield
+
+    worker._expandable_segments_disabled_for_sync = _noop_ctx
+    return worker
+
+
+def _worker_megatron_disk_load_failure_recovers(rank: int, world_size: int, store_path: str, sync_dir: str) -> None:
+    import megatron.bridge.models.conversion.peft_bridge as peft_bridge
+
+    _init_gloo_group(rank, world_size, store_path)
+    orig_empty_cache = torch.cuda.empty_cache
+    orig_build_cfg = peft_bridge.build_adapter_config_dict
+    try:
+        torch.cuda.empty_cache = lambda: None
+        peft_bridge.build_adapter_config_dict = lambda lora_cls, target_modules, base_model_name_or_path: {
+            "r": lora_cls.dim,
+            "lora_alpha": lora_cls.alpha,
+            "target_modules": list(target_modules),
+            "base_model_name_or_path": base_model_name_or_path,
+        }
+
+        worker = _make_megatron_lora_worker(sync_dir, sync_mode="disk")
+        ie_cfg = SimpleNamespace(enable_prefix_caching=True)
+
+        loaded = []
+        resets = []
+
+        async def _load_lora(name: str, path: str):
+            if name == "model_1":
+                raise RuntimeError("Failed to load LoRA adapter 'model_1' on 1/4 server(s): ClientConnectorError")
+            loaded.append((name, path))
+
+        async def _reset_cache(reset_running_requests: bool = True):
+            resets.append(reset_running_requests)
+
+        client = Mock(spec=RemoteInferenceClient)
+        client.load_lora_adapter = AsyncMock(side_effect=_load_lora)
+        client.reset_prefix_cache = AsyncMock(side_effect=_reset_cache)
+
+        async def _run():
+            # Request 1 fails during rank-0 load_lora_adapter.
+            if rank == 0:
+                with pytest.raises(RuntimeError, match="ClientConnectorError"):
+                    await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="model_1")
+            else:
+                await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="model_1")
+
+            # Subsequent multi-tenant requests must succeed without barrier timeouts.
+            await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="model_2")
+            await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="model_3")
+
+        asyncio.run(_run())
+
+        if rank == 0:
+            assert [name for name, _ in loaded] == ["model_2", "model_3"]
+            assert len(resets) == 2
+        else:
+            assert loaded == []
+            assert resets == []
+    finally:
+        torch.cuda.empty_cache = orig_empty_cache
+        peft_bridge.build_adapter_config_dict = orig_build_cfg
+        dist.destroy_process_group()
+
+
+@pytest.mark.megatron
+def test_megatron_lora_disk_sync_load_failure_recovers_multi_tenant(tmp_path):
+    _run_mp(_worker_megatron_disk_load_failure_recovers, 2, tmp_path, str(tmp_path / "lora_sync"))
+
+
+def _worker_megatron_disk_writer_failure_skips_load(rank: int, world_size: int, store_path: str, sync_dir: str) -> None:
+    import megatron.bridge.models.conversion.peft_bridge as peft_bridge
+
+    _init_gloo_group(rank, world_size, store_path)
+    orig_empty_cache = torch.cuda.empty_cache
+    orig_build_cfg = peft_bridge.build_adapter_config_dict
+    try:
+        torch.cuda.empty_cache = lambda: None
+        fail_first = {"flag": True}
+
+        def _build_cfg(lora_cls, target_modules, base_model_name_or_path):
+            if fail_first["flag"]:
+                fail_first["flag"] = False
+                raise OSError("disk full while exporting adapter")
+            return {
+                "r": lora_cls.dim,
+                "lora_alpha": lora_cls.alpha,
+                "target_modules": list(target_modules),
+                "base_model_name_or_path": base_model_name_or_path,
+            }
+
+        peft_bridge.build_adapter_config_dict = _build_cfg
+
+        worker = _make_megatron_lora_worker(sync_dir, sync_mode="disk")
+        ie_cfg = SimpleNamespace(enable_prefix_caching=False)
+
+        client = Mock(spec=RemoteInferenceClient)
+        client.load_lora_adapter = AsyncMock()
+
+        async def _run():
+            if rank == 0:
+                with pytest.raises(OSError, match="disk full"):
+                    await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="model_1")
+                client.load_lora_adapter.assert_not_awaited()
+            else:
+                await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="model_1")
+
+            # Next request succeeds on both ranks.
+            await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="model_2")
+            if rank == 0:
+                client.load_lora_adapter.assert_awaited_once()
+
+        asyncio.run(_run())
+    finally:
+        torch.cuda.empty_cache = orig_empty_cache
+        peft_bridge.build_adapter_config_dict = orig_build_cfg
+        dist.destroy_process_group()
+
+
+@pytest.mark.megatron
+def test_megatron_lora_disk_sync_writer_failure_skips_load_and_recovers(tmp_path):
+    _run_mp(_worker_megatron_disk_writer_failure_skips_load, 2, tmp_path, str(tmp_path / "lora_sync"))
+
+
+def _worker_megatron_memory_sync_failures_recover(rank: int, world_size: int, store_path: str, sync_dir: str) -> None:
+    from skyrl.backends.skyrl_train.weight_sync.sources import LoraAdapterWeightSource
+
+    _init_gloo_group(rank, world_size, store_path)
+    orig_empty_cache = torch.cuda.empty_cache
+    try:
+        torch.cuda.empty_cache = lambda: None
+
+        class _FakeLoraSource(LoraAdapterWeightSource):
+            def __init__(self):
+                super().__init__(dtype=torch.bfloat16, experts_per_shared_adapter=1)
+                self.prepare_calls = []
+
+            def export_adapter_stream(self):
+                self.prepare_calls.append(self._lora_name)
+                if self._lora_name == "tenant-prep-fail" and rank == 1:
+                    raise RuntimeError("rank-1 prepare failure")
+                return [("base_model.model.q_proj.lora_A.weight", torch.ones(2, 4, dtype=torch.bfloat16))]
+
+        class _FakeEngine:
+            skyrl_force_disable_expandable_segments = False
+
+            def __init__(self, source):
+                self.source = source
+                self.sends = []
+
+            def send_weights(self):
+                self.sends.append(self.source._lora_name)
+                list(self.source.iter_full())
+
+        worker = _make_megatron_lora_worker(sync_dir, sync_mode="memory")
+        source = _FakeLoraSource()
+        engine = _FakeEngine(source)
+        worker._lora_weight_source = source
+        worker._weight_sync_engine = engine
+        ie_cfg = SimpleNamespace(enable_prefix_caching=False)
+
+        async def _set_target(target):
+            if target["lora_name"] == "tenant-a":
+                raise RuntimeError("Cannot connect to server during set_lora_receive_target")
+
+        async def _load_lora(lora_name: str, in_memory: bool = False):
+            assert in_memory is True
+            if lora_name == "tenant-b":
+                raise RuntimeError("Cannot connect to server during in-memory load_lora_adapter")
+
+        client = Mock(spec=RemoteInferenceClient)
+        client.set_lora_receive_target = AsyncMock(side_effect=_set_target)
+        client.load_lora_adapter = AsyncMock(side_effect=_load_lora)
+
+        async def _run():
+            # Request 0: rank-1 fails during source.prepare(); rank 0 must NOT arm receivers.
+            if rank == 1:
+                with pytest.raises(RuntimeError, match="rank-1 prepare failure"):
+                    await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-prep-fail")
+            else:
+                await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-prep-fail")
+                client.set_lora_receive_target.assert_not_awaited()
+            assert engine.sends == []
+            assert source._prepared is None
+
+            # Request 1: set_lora_receive_target fails on rank 0.
+            # Neither rank may enter send_weights(), and prepared state must be discarded.
+            if rank == 0:
+                with pytest.raises(RuntimeError, match="set_lora_receive_target"):
+                    await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-a")
+            else:
+                await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-a")
+            assert engine.sends == []
+            assert source._prepared is None
+
+            # Request 2: send_weights succeeds, then load_lora_adapter fails on rank 0.
+            if rank == 0:
+                with pytest.raises(RuntimeError, match="in-memory load_lora_adapter"):
+                    await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-b")
+            else:
+                await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-b")
+            assert engine.sends == ["tenant-b"]
+
+            # Request 3: full in-memory sync succeeds with fresh export for tenant-c.
+            await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-c")
+            assert engine.sends == ["tenant-b", "tenant-c"]
+            assert source.prepare_calls == ["tenant-prep-fail", "tenant-a", "tenant-b", "tenant-c"]
+
+        asyncio.run(_run())
+    finally:
+        torch.cuda.empty_cache = orig_empty_cache
+        dist.destroy_process_group()
+
+
+@pytest.mark.megatron
+def test_megatron_lora_memory_sync_arm_and_load_failures_recover(tmp_path):
+    _run_mp(_worker_megatron_memory_sync_failures_recover, 2, tmp_path, str(tmp_path / "lora_sync"))
+
+
+def _worker_megatron_probe_failure_does_not_strand_peers(
+    rank: int, world_size: int, store_path: str, sync_dir: str
+) -> None:
+    _init_gloo_group(rank, world_size, store_path)
+    try:
+        # Use a regular file path as base_sync_path so rank 0's os.makedirs fails with FileExistsError/NotADirectoryError.
+        bad_path = str(Path(sync_dir) / "not_a_dir")
+        if rank == 0:
+            Path(sync_dir).mkdir(parents=True, exist_ok=True)
+            Path(bad_path).write_text("blocker", encoding="utf-8")
+        dist.barrier()
+
+        worker = _make_megatron_lora_worker(bad_path, sync_mode="disk")
+        if rank == 0:
+            with pytest.raises(OSError):
+                worker._is_lora_sync_writer_rank()
+        else:
+            with pytest.raises(PeerRankSyncError, match="writer probe"):
+                worker._is_lora_sync_writer_rank()
+
+        # Once pointed at a valid directory, probe succeeds on both ranks.
+        worker.cfg.policy.model.lora.lora_sync_path = str(Path(sync_dir) / "valid_dir")
+        is_writer = worker._is_lora_sync_writer_rank()
+        assert is_writer == (rank == 0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.megatron
+def test_megatron_writer_rank_probe_failure_does_not_strand_peers(tmp_path):
+    _run_mp(_worker_megatron_probe_failure_does_not_strand_peers, 2, tmp_path, str(tmp_path / "probe"))
+
+
+# ---------------------------------------------------------------------------
+# Fast in-process unit & concurrency tests
+# ---------------------------------------------------------------------------
+
+
+def test_barrier_with_error_propagation_uninitialized_falls_back_to_barrier(monkeypatch):
+    barriers = []
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "barrier", lambda: barriers.append(1))
+
+    barrier_with_error_propagation(None, stage="test")
+    assert len(barriers) == 1
+
+    with pytest.raises(ValueError, match="boom"):
+        barrier_with_error_propagation(ValueError("boom"), stage="test")
+    assert len(barriers) == 2
+
+
+@pytest.mark.asyncio
+async def test_cleanup_unawaited_task_handles_coro_and_task():
+    async def _never_awaited():
+        return 1
+
+    coro = _never_awaited()
+    await cleanup_unawaited_task(coro)
+    assert coro.cr_frame is None
+
+    cancelled_cleanly = False
+
+    async def _background_task():
+        nonlocal cancelled_cleanly
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled_cleanly = True
+            raise
+
+    task = asyncio.create_task(_background_task())
+    await asyncio.sleep(0)
+    await cleanup_unawaited_task(task)
+    assert task.cancelled()
+    assert cancelled_cleanly is True
+
+    loop = asyncio.get_running_loop()
+    failed_fut = loop.create_future()
+    failed_fut.set_exception(RuntimeError("already failed"))
+    await cleanup_unawaited_task(failed_fut)
+    assert isinstance(failed_fut.exception(), RuntimeError)
+
+
+@pytest.mark.vllm
+def test_lora_source_discard_prepared_forces_reexport():
+    from skyrl.backends.skyrl_train.weight_sync.sources import LoraAdapterWeightSource
+
+    class _CountingSource(LoraAdapterWeightSource):
+        def __init__(self):
+            super().__init__(dtype=torch.float32, experts_per_shared_adapter=1)
+            self.exports = 0
+
+        def export_adapter_stream(self):
+            self.exports += 1
+            return [("base_model.model.q_proj.lora_A.weight", torch.full((2, 2), float(self.exports)))]
+
+    source = _CountingSource()
+    source.set_lora_name("tenant-a")
+    source.prepare()
+    assert source.exports == 1
+    assert len(source.metadata) == 1
+
+    # Discarding clears both _prepared and cached metadata so the next tenant re-exports.
+    source.discard_prepared()
+    source.set_lora_name("tenant-b")
+    source.prepare()
+    assert source.exports == 2
+    assert source.receive_target["lora_name"] == "tenant-b"
+
+
+@pytest.mark.asyncio
+async def test_await_weight_sync_thread_drains_on_cancellation_before_discard():
+    """Cancellation must wait for the worker thread before finally clears prepared state."""
+    import threading
+    import time
+
+    worker = PolicyWorkerBase.__new__(PolicyWorkerBase)
+    started = threading.Event()
+    state = {"prepared": None, "thread_done": False}
+
+    def _slow_prepare():
+        started.set()
+        time.sleep(0.15)
+        state["prepared"] = "stale-tenant-a"
+        state["thread_done"] = True
+
+    async def _run_with_cleanup():
+        try:
+            await worker._await_weight_sync_thread(_slow_prepare)
+        finally:
+            # Must observe thread_done=True so _slow_prepare cannot repopulate after discard.
+            assert state["thread_done"] is True
+            state["prepared"] = None
+
+    task = asyncio.create_task(_run_with_cleanup())
+    while not started.is_set():
+        await asyncio.sleep(0.005)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert state["thread_done"] is True
+    assert state["prepared"] is None
+
+
+def _worker_full_weight_sync_send_failure_on_rank0_recovers(rank: int, world_size: int, store_path: str) -> None:
+    _init_gloo_group(rank, world_size, store_path)
+    orig_empty_cache = torch.cuda.empty_cache
+    try:
+        torch.cuda.empty_cache = lambda: None
+
+        class _Engine:
+            skyrl_handles_prefix_cache_reset = False
+            skyrl_force_disable_expandable_segments = False
+            skyrl_empty_cache_after_send = False
+
+            def __init__(self):
+                self.sends = 0
+
+            def send_weights(self):
+                self.sends += 1
+                if rank == 0 and self.sends == 1:
+                    raise RuntimeError("rank-0 HTTP finish RPC failed after collectives")
+
+        worker = PolicyWorkerBase.__new__(PolicyWorkerBase)
+        worker._weight_sync_engine = _Engine()
+        worker.cfg = SimpleNamespace(
+            fully_async=SimpleNamespace(enabled=False, clear_kv_cache_on_weight_sync=False),
+            placement=SimpleNamespace(colocate_all=False),
+        )
+
+        @contextmanager
+        def _noop_ctx(*args, **kwargs):
+            yield
+
+        worker._expandable_segments_disabled_for_sync = _noop_ctx
+
+        resets = []
+
+        async def _reset_cache(reset_running_requests: bool = True):
+            resets.append(reset_running_requests)
+
+        client = Mock()
+        client.reset_prefix_cache = AsyncMock(side_effect=_reset_cache)
+        ie_cfg = SimpleNamespace(enable_prefix_caching=True)
+
+        async def _run():
+            if rank == 0:
+                with pytest.raises(RuntimeError, match="rank-0 HTTP finish RPC failed"):
+                    await worker._sync_weights_to_inference_engines(client, ie_cfg)
+            else:
+                await worker._sync_weights_to_inference_engines(client, ie_cfg)
+
+            # Second sync must succeed cleanly on both ranks.
+            await worker._sync_weights_to_inference_engines(client, ie_cfg)
+
+        asyncio.run(_run())
+        assert worker._weight_sync_engine.sends == 2
+        if rank == 0:
+            assert len(resets) == 1
+    finally:
+        torch.cuda.empty_cache = orig_empty_cache
+        dist.destroy_process_group()
+
+
+@pytest.mark.vllm
+def test_sync_weights_send_failure_on_rank0_recovers(tmp_path):
+    _run_mp(_worker_full_weight_sync_send_failure_on_rank0_recovers, 2, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_set_lora_receive_target_settles_and_disarms_on_partial_failure():
+    """Partial arm failure (including error-after-arm) settles and disarms all servers."""
+    client = RemoteInferenceClient.__new__(RemoteInferenceClient)
+    client.server_urls = ["http://server-lost-resp:8000", "http://server-good:8001"]
+
+    armed = {}
+    calls = []
+
+    async def _fake_call_server(url: str, endpoint: str, json=None, method="POST", params=None):
+        method_name = json["method"]
+        calls.append((url, method_name))
+        if method_name == "skyrl_set_lora_receive_target":
+            if "server-lost-resp" in url:
+                # Server armed locally before losing the HTTP response.
+                armed[url] = json["kwargs"]["receive_target"]["lora_name"]
+                raise ConnectionResetError("connection lost after arm")
+            await asyncio.sleep(0.08)
+            if url in armed:
+                raise RuntimeError(f"already armed for {armed[url]}")
+            armed[url] = json["kwargs"]["receive_target"]["lora_name"]
+            return url, {"status": 200, "body": {}}
+        if method_name == "skyrl_clear_lora_receive_target":
+            armed.pop(url, None)
+            return url, {"status": 200, "body": {}}
+        raise AssertionError(f"Unexpected method {method_name}")
+
+    client._call_server = _fake_call_server
+
+    with pytest.raises(ConnectionResetError, match="connection lost after arm"):
+        await client.set_lora_receive_target({"kind": "lora", "lora_name": "tenant-a"})
+
+    # Both servers (including the one whose HTTP response failed) must be disarmed.
+    assert armed == {}
+    assert ("http://server-lost-resp:8000", "skyrl_clear_lora_receive_target") in calls
+    assert ("http://server-good:8001", "skyrl_clear_lora_receive_target") in calls
+
+    # Next tenant can arm both servers cleanly.
+    client.server_urls = ["http://server-good:8001"]
+    await client.set_lora_receive_target({"kind": "lora", "lora_name": "tenant-b"})
+    assert armed == {"http://server-good:8001": "tenant-b"}
+
+
+@pytest.mark.asyncio
+async def test_set_lora_receive_target_cancellation_drains_and_disarms():
+    """Parent cancellation drains in-flight arm RPCs and disarms all servers."""
+    client = RemoteInferenceClient.__new__(RemoteInferenceClient)
+    client.server_urls = ["http://server-fast:8000", "http://server-slow:8001"]
+
+    armed = {}
+    fast_armed = asyncio.Event()
+
+    async def _fake_call_server(url: str, endpoint: str, json=None, method="POST", params=None):
+        method_name = json["method"]
+        if method_name == "skyrl_set_lora_receive_target":
+            if "server-fast" in url:
+                armed[url] = json["kwargs"]["receive_target"]["lora_name"]
+                fast_armed.set()
+                return url, {"status": 200, "body": {}}
+            await asyncio.sleep(0.1)
+            armed[url] = json["kwargs"]["receive_target"]["lora_name"]
+            return url, {"status": 200, "body": {}}
+        if method_name == "skyrl_clear_lora_receive_target":
+            armed.pop(url, None)
+            return url, {"status": 200, "body": {}}
+        raise AssertionError(f"Unexpected method {method_name}")
+
+    client._call_server = _fake_call_server
+
+    task = asyncio.create_task(client.set_lora_receive_target({"kind": "lora", "lora_name": "tenant-a"}))
+    await fast_armed.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert armed == {}
+
+
+@pytest.mark.vllm
+def test_skyrl_clear_lora_receive_target_allows_rearm():
+    from skyrl.backends.skyrl_train.weight_sync.lora_target import (
+        build_lora_receive_target,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.weight_receivers import (
+        SkyrlLoraStagingMixin,
+    )
+
+    class _DummyReceiver(SkyrlLoraStagingMixin):
+        vllm_config = SimpleNamespace(lora_config=object())
+
+    receiver = _DummyReceiver()
+    receiver.skyrl_set_lora_receive_target(build_lora_receive_target("tenant-a", {}, {}))
+    assert receiver.skyrl_lora_armed() is True
+
+    receiver.skyrl_clear_lora_receive_target()
+    assert receiver.skyrl_lora_armed() is False
+
+    # Re-arming for the next tenant succeeds cleanly.
+    receiver.skyrl_set_lora_receive_target(build_lora_receive_target("tenant-b", {}, {}))
+    assert receiver.skyrl_lora_armed() is True
+
+
+@pytest.mark.asyncio
+async def test_load_lora_adapter_settles_all_servers_before_raising(monkeypatch):
+    """When one server fails fast, load_lora_adapter settles sibling loads before raising."""
+    from skyrl.backends.skyrl_train.inference_servers import (
+        remote_inference_client as ric_mod,
+    )
+
+    client = RemoteInferenceClient.__new__(RemoteInferenceClient)
+    client.server_urls = ["http://server-bad:8000", "http://server-slow:8001"]
+    client._get_session = AsyncMock(return_value=object())
+
+    slow_settled = False
+
+    class _FakeResp:
+        status = 200
+
+        async def text(self):
+            return "Success"
+
+    class _FakeRequestCtx:
+        def __init__(self, url: str):
+            self.url = url
+
+        async def __aenter__(self):
+            nonlocal slow_settled
+            if "server-bad" in self.url:
+                raise ConnectionRefusedError("Cannot connect to server-bad")
+            await asyncio.sleep(0.1)
+            slow_settled = True
+            return _FakeResp()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(ric_mod, "_control_plane_request", lambda session, method, url, **kw: _FakeRequestCtx(url))
+
+    with pytest.raises(ConnectionRefusedError, match="server-bad"):
+        await client.load_lora_adapter("tenant-a", "/tmp/lora/tenant-a")
+
+    assert slow_settled is True

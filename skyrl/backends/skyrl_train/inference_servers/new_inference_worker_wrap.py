@@ -360,6 +360,15 @@ class NewInferenceWorkerWrap:
             )
         arm(receive_target)
 
+    def skyrl_clear_lora_receive_target(self) -> None:
+        """Disarm a staged LoRA receive target if setup failed on a sibling server."""
+        engine = self.weight_transfer_engine
+        if engine is None:
+            return
+        clear = getattr(engine, "skyrl_clear_lora_receive_target", None)
+        if clear is not None:
+            clear()
+
     def skyrl_param_digest(self) -> dict:
         """Diagnostic: ``{name: "shape|dtype|blake2b"}`` over every parameter and buffer of the live model.
 

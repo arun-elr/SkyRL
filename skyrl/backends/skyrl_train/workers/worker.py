@@ -63,8 +63,11 @@ from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     BaseBatchIterator,
     BatchIterator,
+    PeerRankSyncError,
     TokenBasedBatchIterator,
     all_reduce_metrics,
+    barrier_with_error_propagation,
+    cleanup_unawaited_task,
     compute_minibatch_rollout_logprob_diff_metrics,
     get_microbatch_iterator,
     reduce_metrics,
@@ -644,6 +647,19 @@ class Worker(DistributedTorchRayActor):
 
         return asyncio.to_thread(run)
 
+    async def _await_weight_sync_thread(self, fn: Callable, *args, **kwargs):
+        """Run ``fn`` via ``_weight_sync_thread`` and drain it before propagating cancellation."""
+        fut = asyncio.ensure_future(self._weight_sync_thread(fn, *args, **kwargs))
+        cancelled = False
+        while not fut.done():
+            try:
+                await asyncio.wait({fut})
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError() from fut.exception()
+        return fut.result()
+
     def _should_reset_prefix_cache(self, inference_engine_cfg) -> bool:
         """Whether this sync should clear the inference engines' prefix cache.
 
@@ -693,24 +709,38 @@ class Worker(DistributedTorchRayActor):
         if not engine.skyrl_handles_prefix_cache_reset:
             cache_reset_task = self._reset_prefix_cache_task(inference_engine_client, inference_engine_cfg)
 
-        torch.cuda.empty_cache()
-
-        # Under colocate_all the CUDA-IPC path calls cudaIpcGetMemHandle, which
-        # is incompatible with the VMM addresses expandable segments use; some
-        # engines (sharded_rdt) share GPU memory on every run and ask for the
-        # toggle unconditionally.
-        with self._expandable_segments_disabled_for_sync(force=engine.skyrl_force_disable_expandable_segments):
-            await self._weight_sync_thread(engine.send_weights)
-
-        if cache_reset_task is not None:
-            await cache_reset_task
-        # An engine whose send buffers are reused next step declares
-        # empty_cache_after_send=False: scrubbing them back to CUDA costs
-        # 0.25-0.53s per rank at 235B and buys nothing. Under colocation an
-        # inference engine wants the physical memory, so empty regardless.
-        if engine.skyrl_empty_cache_after_send or self.cfg.placement.colocate_all:
+        try:
             torch.cuda.empty_cache()
-        torch.distributed.barrier()
+
+            # Under colocate_all the CUDA-IPC path calls cudaIpcGetMemHandle, which
+            # is incompatible with the VMM addresses expandable segments use; some
+            # engines (sharded_rdt) share GPU memory on every run and ask for the
+            # toggle unconditionally.
+            sync_error: Optional[BaseException] = None
+            with self._expandable_segments_disabled_for_sync(force=engine.skyrl_force_disable_expandable_segments):
+                try:
+                    await self._await_weight_sync_thread(engine.send_weights)
+                except (Exception, asyncio.CancelledError) as exc:
+                    sync_error = exc
+
+            if sync_error is None and cache_reset_task is not None:
+                try:
+                    await cache_reset_task
+                except (Exception, asyncio.CancelledError) as exc:
+                    sync_error = exc
+                finally:
+                    cache_reset_task = None
+            # An engine whose send buffers are reused next step declares
+            # empty_cache_after_send=False: scrubbing them back to CUDA costs
+            # 0.25-0.53s per rank at 235B and buys nothing. Under colocation an
+            # inference engine wants the physical memory, so empty regardless.
+            if engine.skyrl_empty_cache_after_send or self.cfg.placement.colocate_all:
+                torch.cuda.empty_cache()
+            barrier_with_error_propagation(sync_error, stage="weight sync")
+        except PeerRankSyncError:
+            return
+        finally:
+            await cleanup_unawaited_task(cache_reset_task)
 
     def forward(self, *args, **kwargs) -> WorkerOutput:
         """Run forward pass on the input batch.

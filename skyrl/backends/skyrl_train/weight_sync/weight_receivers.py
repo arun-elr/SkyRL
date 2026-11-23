@@ -199,6 +199,11 @@ class SkyrlLoraStagingMixin:
     def skyrl_lora_armed(self) -> bool:
         return self._skyrl_lora_target is not None
 
+    def skyrl_clear_lora_receive_target(self) -> None:
+        """Disarm a previously armed LoRA receive target (e.g. after a partial setup failure)."""
+        self._skyrl_lora_target = None
+        self._skyrl_lora_staged = None
+
     def skyrl_begin_lora_update(self) -> None:
         self._skyrl_lora_staged = {}
 
