@@ -463,7 +463,9 @@ class MegatronHFExportConfig(BaseConfig):
       ``<export_dir>/lora_adapter/``.
 
     ``"adapter"`` and ``"both"`` require ``trainer.strategy="megatron"`` and LoRA
-    (``policy.model.lora.rank > 0``)."""
+    (``policy.model.lora.rank > 0``). For checkpoints with packed HF expert weights
+    (``experts.gate_up_proj`` / ``experts.down_proj``), targeting routed experts requires
+    ``moe_grouped_gemm=True`` and ``lora_config.experts_shared_outer_loras=False``."""
     expand_shared_outer: bool = False
     """Passed to ``AutoBridge.save_hf_adapter`` for shared-outer MoE LoRA
     (``lora_config.experts_shared_outer_loras=True``): replicate the shared factor across experts

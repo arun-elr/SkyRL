@@ -188,6 +188,7 @@ merged weights.
     - `"merged"`: merge LoRA weights into the base model and save a full HF checkpoint to `{export_path}/global_step_{N}/policy/`
     - `"adapter"`: write only the PEFT adapter (and tokenizer) to `{export_path}/global_step_{N}/policy/`
     - `"both"`: write the merged HF model to `{export_path}/global_step_{N}/policy/` and the PEFT adapter to `{export_path}/global_step_{N}/policy/lora_adapter/`
+  - **Packed-expert note**: for checkpoints with packed HF expert weights (`experts.gate_up_proj` / `experts.down_proj`), exporting adapters that target routed experts requires `moe_grouped_gemm=true` and `lora_config.experts_shared_outer_loras=false`.
 
 `trainer.policy.megatron_config.hf_export_config.expand_shared_outer`
   - **Default**: `false`

@@ -486,19 +486,40 @@ def peft_targets_routed_experts(peft_config, module_patterns: Optional[Iterable[
     return not packed_leaves.issubset(exclude_idents)
 
 
-def validate_shared_outer_adapter_export_supported(bridge, peft_config=None) -> None:
-    """Reject shared-outer LoRA HF adapter export on bridges with packed HF expert weights."""
+def validate_packed_expert_adapter_export_supported(bridge, peft_config=None, *, moe_grouped_gemm: bool = True) -> None:
+    """Reject LoRA HF adapter export on packed HF expert checkpoints when Bridge cannot stack experts.
+
+    Pinned Megatron-Bridge only stacks packed HF expert adapters (``experts.gate_up_proj`` /
+    ``experts.down_proj``) into 3D PEFT ``ParamWrapper`` tensors for non-shared-outer grouped
+    experts (``moe_grouped_gemm=True`` and ``experts_shared_outer_loras=False``). Both
+    ``experts_shared_outer_loras=True`` and sequential experts (``moe_grouped_gemm=False``) emit
+    per-expert 2D slices under the same HF key, which overwrites earlier experts during PEFT dict
+    conversion.
+    """
+    is_shared_outer = getattr(peft_config, "experts_shared_outer_loras", False) is True
+    is_sequential = not moe_grouped_gemm
+    if not is_shared_outer and not is_sequential:
+        return
     packed_patterns = _packed_hf_expert_module_patterns(bridge)
     if not packed_patterns:
         return
     if peft_config is not None and not peft_targets_routed_experts(peft_config, packed_patterns):
         return
+    if is_shared_outer:
+        raise ValueError(
+            "LoRA adapter HF export (`hf_export_config.lora_export_format` in ('adapter', 'both')) "
+            "with `experts_shared_outer_loras=True` is not supported for checkpoints with packed HF "
+            "expert weights (e.g. `experts.gate_up_proj` / `experts.down_proj`): Megatron-Bridge's "
+            "`save_hf_adapter` emits each expert under the same HF key and drops earlier experts. "
+            "Use `lora_export_format='merged'` or disable `experts_shared_outer_loras`."
+        )
     raise ValueError(
         "LoRA adapter HF export (`hf_export_config.lora_export_format` in ('adapter', 'both')) "
-        "with `experts_shared_outer_loras=True` is not supported for checkpoints with packed HF "
-        "expert weights (e.g. `experts.gate_up_proj` / `experts.down_proj`): Megatron-Bridge's "
-        "`save_hf_adapter` emits each expert under the same HF key and drops earlier experts. "
-        "Use `lora_export_format='merged'` or disable `experts_shared_outer_loras`."
+        "with sequential MoE experts (`moe_grouped_gemm=False`) is not supported for checkpoints "
+        "with packed HF expert weights (e.g. `experts.gate_up_proj` / `experts.down_proj`): "
+        "Megatron-Bridge's `save_hf_adapter` only stacks grouped experts and otherwise emits each "
+        "expert under the same HF key, dropping earlier experts. Use `lora_export_format='merged'` "
+        "or enable `moe_grouped_gemm=True`."
     )
 
 

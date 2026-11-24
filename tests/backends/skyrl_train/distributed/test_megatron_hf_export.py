@@ -395,6 +395,7 @@ def test_megatron_worker_save_hf_model_forwards_adapter_export_config(monkeypatc
         base_model_name_or_path="Qwen/Qwen3-8B",
         expand_shared_outer=True,
         allow_serving_layout=False,
+        moe_grouped_gemm=True,
     )
 
 
@@ -673,3 +674,99 @@ def test_packed_experts_reject_wildcard_targets_matching_routed_experts(tmp_path
     save_adapter.assert_not_called()
     save_weights.assert_not_called()
     barrier.assert_not_called()
+
+
+@pytest.mark.parametrize("fmt", ["adapter", "both"])
+def test_packed_experts_reject_sequential_experts_adapter_export_without_shared_outer(tmp_path, monkeypatch, fmt):
+    """Sequential MoE experts (`moe_grouped_gemm=False`) on packed HF checkpoints must fail even without shared-outer."""
+    import torch
+
+    from skyrl.train.config import SkyRLLoraConfig, SkyRLTrainConfig
+
+    barrier = Mock()
+    monkeypatch.setattr(strategy_mod.dist, "barrier", barrier)
+    cfg = SkyRLTrainConfig().trainer
+    cfg.strategy = "megatron"
+    cfg.policy.model.lora = SkyRLLoraConfig(rank=8, alpha=8)
+    cfg.policy.megatron_config.moe_grouped_gemm = False
+    cfg.policy.megatron_config.lora_config.experts_shared_outer_loras = False
+    cfg.policy.megatron_config.hf_export_config.lora_export_format = fmt
+
+    bridge, save_adapter, save_weights = _make_bridge_with_registry(_packed_expert_registry(sequential=True))
+    worker = worker_mod.MegatronPolicyWorkerBase.__new__(worker_mod.MegatronPolicyWorkerBase)
+    worker.cfg = cfg
+    worker.megatron_config = cfg.policy.megatron_config
+    worker.bridge = bridge
+    worker.provider = SimpleNamespace(
+        num_moe_experts=2,
+        moe_grouped_gemm=False,
+        vision_config=None,
+        multi_latent_attention=False,
+    )
+    worker.is_vlm = False
+    worker._rank = 0
+
+    with pytest.raises(ValueError, match="moe_grouped_gemm=False"):
+        worker.configure_lora(cfg.policy.model.lora, lora_type="lora", experts_shared_outer_loras=False)
+
+    # Distinct per-expert sequential weights (local_experts.0 != local_experts.1) that would collide on export.
+    distinct_seq_experts = SimpleNamespace(
+        local_experts=[
+            SimpleNamespace(linear_fc1=torch.ones(4, 2), linear_fc2=torch.full((2, 4), 1.5)),
+            SimpleNamespace(linear_fc1=torch.full((4, 2), 2.0), linear_fc2=torch.full((2, 4), 3.0)),
+        ]
+    )
+    owner = _make_strategy(is_lora=True, is_rank_0=True)
+    owner.megatron_config = cfg.policy.megatron_config
+    peft_config = SkyRLLoRA(dim=8, alpha=8, experts_shared_outer_loras=False)
+    with pytest.raises(ValueError, match="moe_grouped_gemm=False"):
+        owner.save_hf_model(
+            bridge,
+            SimpleNamespace(actor_module=[distinct_seq_experts]),
+            str(tmp_path / "seq_packed"),
+            lora_export_format=fmt,
+            peft_config=peft_config,
+            moe_grouped_gemm=False,
+        )
+
+    save_adapter.assert_not_called()
+    save_weights.assert_not_called()
+    barrier.assert_not_called()
+
+
+def test_packed_experts_sequential_allows_attention_only_adapter_export(tmp_path, monkeypatch):
+    from skyrl.train.config import SkyRLLoraConfig, SkyRLTrainConfig
+
+    monkeypatch.setattr(strategy_mod.dist, "barrier", Mock())
+    cfg = SkyRLTrainConfig().trainer
+    cfg.strategy = "megatron"
+    cfg.policy.model.lora = SkyRLLoraConfig(rank=8, alpha=8, train_mlp=False)
+    cfg.policy.megatron_config.moe_grouped_gemm = False
+    cfg.policy.megatron_config.hf_export_config.lora_export_format = "adapter"
+
+    bridge, save_adapter, _ = _make_bridge_with_registry(_packed_expert_registry(sequential=True))
+    worker = worker_mod.MegatronPolicyWorkerBase.__new__(worker_mod.MegatronPolicyWorkerBase)
+    worker.cfg = cfg
+    worker.megatron_config = cfg.policy.megatron_config
+    worker.bridge = bridge
+    worker.provider = SimpleNamespace(
+        num_moe_experts=2,
+        moe_grouped_gemm=False,
+        vision_config=None,
+        multi_latent_attention=False,
+    )
+    worker.is_vlm = False
+    worker._rank = 0
+
+    worker.configure_lora(cfg.policy.model.lora, lora_type="lora", experts_shared_outer_loras=False)
+
+    owner = _make_strategy(is_lora=True, is_rank_0=True)
+    owner.save_hf_model(
+        bridge,
+        SimpleNamespace(actor_module=["chunk0"]),
+        str(tmp_path / "seq_packed_attn_only"),
+        lora_export_format="adapter",
+        peft_config=worker.lora_cls,
+        moe_grouped_gemm=False,
+    )
+    save_adapter.assert_called_once()

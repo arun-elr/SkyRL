@@ -44,7 +44,7 @@ from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
     get_model_config,
     get_moe_metrics,
     print_model_size,
-    validate_shared_outer_adapter_export_supported,
+    validate_packed_expert_adapter_export_supported,
 )
 from skyrl.backends.skyrl_train.distributed.megatron.optimizer import (
     get_megatron_optimizer,
@@ -718,10 +718,6 @@ class MegatronWorker:
                 ),
                 module_dims=self._lora_import_plan.module_dims if self._lora_import_plan else {},
             )
-            if experts_shared_outer_loras:
-                hf_export = getattr(self.megatron_config, "hf_export_config", None)
-                if getattr(hf_export, "lora_export_format", "merged") in ("adapter", "both"):
-                    validate_shared_outer_adapter_export_supported(self.bridge, self.lora_cls)
         elif lora_type == "canonical_lora":
             if experts_shared_outer_loras:
                 raise ValueError("experts_shared_outer_loras is only supported with lora_type='lora'")
@@ -735,6 +731,19 @@ class MegatronWorker:
                 lora_B_init_method="zero",
                 exclude_modules=[] if lora_config.exclude_modules is None else lora_config.exclude_modules,
                 normalize_moe_lora=self.cfg.policy.megatron_config.lora_config.normalize_moe_lora,
+            )
+
+        hf_export = getattr(self.megatron_config, "hf_export_config", None)
+        if getattr(hf_export, "lora_export_format", "merged") in ("adapter", "both"):
+            moe_grouped_gemm = bool(
+                getattr(
+                    self.provider,
+                    "moe_grouped_gemm",
+                    getattr(self.megatron_config, "moe_grouped_gemm", True),
+                )
+            )
+            validate_packed_expert_adapter_export_supported(
+                self.bridge, self.lora_cls, moe_grouped_gemm=moe_grouped_gemm
             )
 
     def _plan_lora_import(self, lora_config, lora_type: Optional[str]):
@@ -1083,6 +1092,10 @@ class MegatronWorker:
         sync_params_for_export(self.actor_module, getattr(self, "optimizer", None))
         # Save model in HuggingFace safetensors format
         hf_export = self.megatron_config.hf_export_config
+        provider = getattr(self, "provider", None)
+        moe_grouped_gemm = bool(
+            getattr(provider, "moe_grouped_gemm", getattr(self.megatron_config, "moe_grouped_gemm", True))
+        )
         self.strategy.save_hf_model(
             self.bridge,
             self.model,
@@ -1095,6 +1108,7 @@ class MegatronWorker:
             base_model_name_or_path=getattr(self, "_logical_model_path", None) or None,
             expand_shared_outer=getattr(hf_export, "expand_shared_outer", False),
             allow_serving_layout=getattr(hf_export, "allow_serving_layout", False),
+            moe_grouped_gemm=moe_grouped_gemm,
         )
 
     def _get_module_for_offload(self):

@@ -36,7 +36,7 @@ from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
     offload_megatron_grads_to_cpu,
     offload_megatron_model_to_cpu,
     offload_megatron_optimizer,
-    validate_shared_outer_adapter_export_supported,
+    validate_packed_expert_adapter_export_supported,
 )
 from skyrl.backends.skyrl_train.distributed.megatron.optimizer_offload_to_disk import (
     CHECKPOINT_SUBDIR as OFFLOAD_TO_DISK_CHECKPOINT_SUBDIR,
@@ -782,6 +782,7 @@ class MegatronStrategy(DistributedStrategy):
         base_model_name_or_path: Optional[str] = None,
         expand_shared_outer: bool = False,
         allow_serving_layout: bool = False,
+        moe_grouped_gemm: Optional[bool] = None,
         **kwargs,
     ) -> None:
         if lora_export_format not in VALID_LORA_EXPORT_FORMATS:
@@ -799,8 +800,11 @@ class MegatronStrategy(DistributedStrategy):
                 )
             if expand_shared_outer and allow_serving_layout:
                 raise ValueError("expand_shared_outer and allow_serving_layout cannot both be True.")
-            if getattr(peft_config, "experts_shared_outer_loras", False) is True:
-                validate_shared_outer_adapter_export_supported(bridge, peft_config)
+            if moe_grouped_gemm is None:
+                mcfg = getattr(self, "megatron_config", None)
+                tcfg = getattr(mcfg, "transformer_config_kwargs", None) or {}
+                moe_grouped_gemm = bool(tcfg.get("moe_grouped_gemm", getattr(mcfg, "moe_grouped_gemm", True)))
+            validate_packed_expert_adapter_export_supported(bridge, peft_config, moe_grouped_gemm=moe_grouped_gemm)
         elif expand_shared_outer or allow_serving_layout:
             raise ValueError(
                 "expand_shared_outer and allow_serving_layout require lora_export_format to be 'adapter' or 'both'."
