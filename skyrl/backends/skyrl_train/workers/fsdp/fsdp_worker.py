@@ -180,6 +180,23 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         sync_error: Optional[BaseException] = None
         if torch.distributed.get_rank() == 0:
             try:
+                from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+                    RemoteInferenceClient,
+                    control_plane_timeout_budget,
+                    drain_client_pending_lora_loads,
+                    rank0_phase_timeout_s,
+                )
+
+                phase_budget = rank0_phase_timeout_s()
+                unresolved_loads = await drain_client_pending_lora_loads(
+                    inference_engine_client, timeout_s=phase_budget
+                )
+                if unresolved_loads:
+                    raise TimeoutError(
+                        f"Cannot overwrite disk LoRA files for {lora_name!r} while prior load_lora_adapter "
+                        f"request(s) are still in flight or unconfirmed: {', '.join(unresolved_loads)}"
+                    )
+
                 os.makedirs(lora_sync_path, exist_ok=True)
 
                 peft_config = asdict(peft_model.peft_config.get("default", {}))
@@ -193,13 +210,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                     json.dump(peft_config, f, ensure_ascii=False, indent=4)
 
                 # Send LoRA disk loading request to inference engine.
-                from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
-                    RemoteInferenceClient,
-                    control_plane_timeout_budget,
-                    rank0_phase_timeout_s,
-                )
-
-                with control_plane_timeout_budget(rank0_phase_timeout_s()):
+                with control_plane_timeout_budget(phase_budget):
                     if isinstance(inference_engine_client, RemoteInferenceClient):
                         await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
                     else:

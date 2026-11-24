@@ -2241,9 +2241,30 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         )
         from safetensors.torch import save_file
 
+        from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+            drain_client_pending_lora_loads,
+            rank0_phase_timeout_s,
+        )
         from skyrl.backends.skyrl_train.weight_sync.sources import (
             adapter_target_modules,
         )
+
+        # Ensure any prior timed-out load_lora_adapter has finished reading disk
+        # adapter files before any writer rank exports and overwrites lora_sync_path.
+        preflight_error: Optional[BaseException] = None
+        if torch.distributed.get_rank() == 0:
+            try:
+                unresolved_loads = await drain_client_pending_lora_loads(
+                    inference_engine_client, timeout_s=rank0_phase_timeout_s()
+                )
+                if unresolved_loads:
+                    raise TimeoutError(
+                        f"Cannot overwrite disk LoRA files for {lora_name!r} while prior load_lora_adapter "
+                        f"request(s) are still in flight or unconfirmed: {', '.join(unresolved_loads)}"
+                    )
+            except (Exception, asyncio.CancelledError) as exc:
+                preflight_error = exc
+        barrier_with_error_propagation(preflight_error, stage="LoRA disk load preflight")
 
         # Export with cpu=False on every rank so Megatron-Bridge never performs
         # writer-only CPU copies inside the iterator before yielding (where a

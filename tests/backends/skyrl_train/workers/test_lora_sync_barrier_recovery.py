@@ -2762,3 +2762,156 @@ async def test_megatron_in_memory_send_failure_with_inflight_rpc_defers_clear(tm
         release_start.set()
         blocking_client.drain_inflight(deadline_at=time.monotonic() + 2.0)
         blocking_client.close()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_load_lora_adapter_stays_tracked_and_blocks_overlap(monkeypatch):
+    """A timed-out load_lora_adapter keeps its task tracked until server confirmation, blocking reload, unload, and arm."""
+    from skyrl.backends.skyrl_train.inference_servers import (
+        remote_inference_client as ric_mod,
+    )
+    from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+        control_plane_timeout_budget,
+    )
+
+    client = RemoteInferenceClient.__new__(RemoteInferenceClient)
+    client.server_urls = ["http://server-0:8000"]
+    client._get_session = AsyncMock(return_value=object())
+
+    release_load = asyncio.Event()
+    load_calls = {"n": 0}
+    seen_connect_only = []
+
+    class _FakeResp:
+        status = 200
+
+        async def text(self):
+            return "Success"
+
+    class _SlowLoadCtx:
+        async def __aenter__(self):
+            load_calls["n"] += 1
+            if load_calls["n"] == 1:
+                await release_load.wait()
+            return _FakeResp()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    def _fake_request(session, method, url, *, connect_only=False, **kw):
+        seen_connect_only.append(connect_only)
+        return _SlowLoadCtx()
+
+    monkeypatch.setattr(ric_mod, "_control_plane_request", _fake_request)
+
+    # Round 1: load_lora_adapter times out within budget while server request keeps running.
+    with control_plane_timeout_budget(0.1):
+        with pytest.raises(InferenceServerTimeoutError, match="load_lora_adapter"):
+            await client.load_lora_adapter("tenant-a", "/tmp/lora/tenant-a")
+    assert seen_connect_only == [True]
+    assert load_calls["n"] == 1
+
+    # While Round 1's load is still running on the server, unload / reload / arm MUST all be blocked.
+    with control_plane_timeout_budget(0.1):
+        with pytest.raises(InferenceServerTimeoutError, match="still in flight"):
+            await client.unload_lora_adapter("tenant-a")
+        with pytest.raises(InferenceServerTimeoutError, match="still in flight"):
+            await client.load_lora_adapter("tenant-a", "/tmp/lora/tenant-a")
+        with pytest.raises(InferenceServerTimeoutError, match="prior load_lora_adapter"):
+            await client.set_lora_receive_target({"lora_name": "tenant-b"})
+    assert load_calls["n"] == 1
+
+    # Once Round 1's server load actually finishes, Round 2 succeeds cleanly.
+    release_load.set()
+    with control_plane_timeout_budget(2.0):
+        resp = await client.load_lora_adapter("tenant-a", "/tmp/lora/tenant-a")
+    assert "http://server-0:8000" in resp
+    assert load_calls["n"] == 2
+
+
+def test_overlapping_deadline_scopes_exit_out_of_order_without_corrupting_budgets():
+    """Overlapping weight_sync_client_deadline scopes exiting out of order must not pop each other's budgets."""
+    import threading
+    import time
+
+    from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+        current_weight_sync_deadline,
+        weight_sync_client_deadline,
+    )
+
+    a_entered = threading.Event()
+    b_entered = threading.Event()
+    a_exited = threading.Event()
+    observed = {}
+
+    t_now = time.monotonic()
+    deadline_a = t_now + 5.0
+    deadline_b = t_now + 20.0
+
+    def _thread_a():
+        with weight_sync_client_deadline(deadline_a):
+            a_entered.set()
+            assert b_entered.wait(timeout=2.0)
+            observed["a_during"] = current_weight_sync_deadline()
+        a_exited.set()
+
+    def _thread_b():
+        assert a_entered.wait(timeout=2.0)
+        with weight_sync_client_deadline(deadline_b):
+            b_entered.set()
+            observed["b_before_a_exit"] = current_weight_sync_deadline()
+            assert a_exited.wait(timeout=2.0)
+            observed["b_after_a_exit"] = current_weight_sync_deadline()
+            # Unscoped worker thread should see B's remaining deadline, not None or A's.
+            worker_seen = []
+            wt = threading.Thread(target=lambda: worker_seen.append(current_weight_sync_deadline()))
+            wt.start()
+            wt.join(timeout=2.0)
+            observed["worker_after_a_exit"] = worker_seen[0]
+
+    ta = threading.Thread(target=_thread_a)
+    tb = threading.Thread(target=_thread_b)
+    ta.start()
+    tb.start()
+    ta.join(timeout=3.0)
+    tb.join(timeout=3.0)
+
+    assert observed["a_during"] == deadline_a
+    assert observed["b_before_a_exit"] == deadline_b
+    assert observed["b_after_a_exit"] == deadline_b
+    assert observed["worker_after_a_exit"] == deadline_b
+    assert current_weight_sync_deadline() is None
+
+
+@pytest.mark.vllm
+def test_monotonic_round_fence_never_evicts_old_cancelled_arm():
+    """Per-client monotonic <client_id>:<seq> tokens reject stale arms even after >1024 later cancellations."""
+    from skyrl.backends.skyrl_train.weight_sync.lora_target import (
+        build_lora_receive_target,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.weight_receivers import (
+        SkyrlLoraStagingMixin,
+    )
+
+    class _Receiver(SkyrlLoraStagingMixin):
+        def __init__(self):
+            self.vllm_config = SimpleNamespace(lora_config=object())
+
+    recv = _Receiver()
+    client_id = "trainerclient1"
+    stale_target = {**build_lora_receive_target("tenant-stale", {}, {}), "round_id": f"{client_id}:1"}
+
+    # Cancel round 1, then cancel 1,200 newer rounds (exceeding the old 1,024 tombstone cap).
+    recv.skyrl_clear_lora_receive_target(round_id=f"{client_id}:1")
+    for seq in range(2, 1205):
+        recv.skyrl_clear_lora_receive_target(round_id=f"{client_id}:{seq}")
+
+    # Round 1 must STILL be rejected forever.
+    with pytest.raises(RuntimeError, match="already cancelled or superseded"):
+        recv.skyrl_set_lora_receive_target(stale_target)
+    assert recv.skyrl_lora_armed() is False
+
+    # Round 1205 succeeds.
+    fresh_target = {**build_lora_receive_target("tenant-fresh", {}, {}), "round_id": f"{client_id}:1205"}
+    recv.skyrl_set_lora_receive_target(fresh_target)
+    assert recv.skyrl_lora_armed() is True

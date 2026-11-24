@@ -34,6 +34,7 @@ import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -51,31 +52,39 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Process-local deadline stack and client registry. Unlike a ContextVar, a
-# lock-protected process-local stack propagates into nested ThreadPoolExecutors
-# (such as vLLM's NCCLTrainerWeightTransferEngine, which submits update_weights
-# on its own worker pool) and shares one absolute monotonic deadline across all
-# sequential RPCs (start / update / finish) within a single weight-sync round.
+# Per-context deadline (so concurrent/overlapping scopes in different threads
+# never corrupt each other's budget) plus a lock-protected token-keyed fallback
+# table so nested ThreadPoolExecutors that do not copy ContextVars (such as
+# vLLM's NCCLTrainerWeightTransferEngine) still inherit the tightest active
+# finite deadline.
+_UNSET_DEADLINE = object()
+_THREAD_DEADLINE_VAR: ContextVar[Any] = ContextVar("_THREAD_DEADLINE_VAR", default=_UNSET_DEADLINE)
 _CONTROL_PLANE_LOCK = threading.Lock()
-_WEIGHT_SYNC_DEADLINE_STACK: List[Optional[float]] = []
+_WEIGHT_SYNC_DEADLINE_SCOPES: List[Tuple[object, Optional[float]]] = []
 _ACTIVE_CLIENTS: "weakref.WeakSet[SkyrlWeightSyncClient]" = weakref.WeakSet()
 
 
 @contextmanager
 def weight_sync_client_deadline(deadline_at: Optional[float]) -> Iterator[None]:
-    """Bind all blocking ``SkyrlWeightSyncClient`` calls in this process to one absolute deadline.
+    """Bind blocking ``SkyrlWeightSyncClient`` calls in this scope to one absolute deadline.
 
     ``deadline_at`` is a ``time.monotonic()`` timestamp (or ``None`` for no
-    deadline). Applies across nested thread pools and sequential RPCs within
-    the block.
+    deadline). Uses a ContextVar for same-thread / nested scopes and a
+    token-keyed active-scope table for nested thread pools, so overlapping
+    scopes exiting out of order cannot pop each other's deadlines.
     """
+    scope_token = object()
+    cv_token = _THREAD_DEADLINE_VAR.set(deadline_at)
     with _CONTROL_PLANE_LOCK:
-        _WEIGHT_SYNC_DEADLINE_STACK.append(deadline_at)
+        _WEIGHT_SYNC_DEADLINE_SCOPES.append((scope_token, deadline_at))
     try:
         yield
     finally:
+        _THREAD_DEADLINE_VAR.reset(cv_token)
         with _CONTROL_PLANE_LOCK:
-            _WEIGHT_SYNC_DEADLINE_STACK.pop()
+            _WEIGHT_SYNC_DEADLINE_SCOPES[:] = [
+                entry for entry in _WEIGHT_SYNC_DEADLINE_SCOPES if entry[0] is not scope_token
+            ]
 
 
 @contextmanager
@@ -87,9 +96,13 @@ def weight_sync_client_timeout(timeout_s: Optional[float]) -> Iterator[None]:
 
 
 def current_weight_sync_deadline() -> Optional[float]:
-    """Return the active process-local weight-sync monotonic deadline, if any."""
+    """Return the active weight-sync monotonic deadline for this context (or tightest active scope)."""
+    local_val = _THREAD_DEADLINE_VAR.get()
+    if local_val is not _UNSET_DEADLINE:
+        return local_val
     with _CONTROL_PLANE_LOCK:
-        return _WEIGHT_SYNC_DEADLINE_STACK[-1] if _WEIGHT_SYNC_DEADLINE_STACK else None
+        finite = [d for _, d in _WEIGHT_SYNC_DEADLINE_SCOPES if d is not None]
+        return min(finite) if finite else None
 
 
 def _current_process_deadline() -> Optional[float]:
