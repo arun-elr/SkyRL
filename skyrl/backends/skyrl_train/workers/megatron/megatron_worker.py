@@ -2153,6 +2153,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         if any_send_failed:
             cleanup_error: Optional[BaseException] = None
             if rank == 0:
+                # Mark the current round dirty BEFORE awaiting cleanup so even if
+                # rank 0 is cancelled mid-drain, the next round's set_lora_receive_target
+                # will still run preflight disarm for this round_id after settlement.
+                # A confirmed clear_lora_receive_target below clears the dirty marker.
+                inference_engine_client.mark_lora_servers_dirty()
                 try:
                     cleanup_deadline = time.monotonic() + phase_budget if phase_budget > 0 else None
                     drain_deadline = time.monotonic() + max(0.05, phase_budget * 0.5) if phase_budget > 0 else None
@@ -2161,9 +2166,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                         # Do NOT disarm servers while a prior lifecycle RPC is still
                         # running or unconfirmed: disarming now could let a delayed
                         # /start_weight_update fall through to a base-model reload.
-                        # Keep the target armed and mark servers dirty so preflight
-                        # disarms only after all in-flight RPCs settle.
-                        inference_engine_client.mark_lora_servers_dirty()
+                        # Keep the target armed and dirty so preflight disarms only
+                        # after all in-flight RPCs settle.
                         if send_error is not None:
                             send_error.add_note(
                                 f"Prior blocking weight-sync request(s) still in flight or unconfirmed after send "

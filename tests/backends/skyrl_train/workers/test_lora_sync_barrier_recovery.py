@@ -2660,6 +2660,22 @@ async def test_megatron_in_memory_send_failure_with_inflight_rpc_defers_clear(tm
         assert len(clear_calls) == 1
         assert receiver.skyrl_lora_armed() is False
         client.load_lora_adapter.assert_awaited_once_with("tenant-b", in_memory=True)
+
+        # Round 3: cancel rank 0 mid-drain during send-failure cleanup. The old round MUST already be
+        # marked dirty so Round 4 preflight-disarms it after settlement instead of hitting "already armed".
+        release_start.clear()
+        task = asyncio.create_task(worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-c"))
+        await asyncio.sleep(0.35)
+        task.cancel()
+        with pytest.raises((asyncio.CancelledError, TimeoutError)):
+            await task
+        assert receiver.skyrl_lora_armed() is True
+        release_start.set()
+        blocking_client.drain_inflight(deadline_at=time.monotonic() + 2.0)
+
+        await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-d")
+        assert receiver.skyrl_lora_armed() is False
+        assert client.load_lora_adapter.await_count == 2
     finally:
         release_start.set()
         blocking_client.drain_inflight(deadline_at=time.monotonic() + 2.0)

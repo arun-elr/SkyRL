@@ -382,10 +382,10 @@ class SkyrlWeightSyncClient:
             self._unconfirmed_lifecycle_requests = unconfirmed
         return unconfirmed
 
-    def _deferred_resume_ids(self) -> set[int]:
+    def _deferred_resume_set(self) -> "weakref.WeakSet[Future]":
         deferred = getattr(self, "_deferred_resume_futures", None)
         if deferred is None:
-            deferred = set()
+            deferred = weakref.WeakSet()
             self._deferred_resume_futures = deferred
         return deferred
 
@@ -423,10 +423,10 @@ class SkyrlWeightSyncClient:
     def _schedule_deferred_resume(self, url: str, fut: Future) -> None:
         deferred_fut: Future = Future()
         with _CONTROL_PLANE_LOCK:
-            deferred = self._deferred_resume_ids()
-            if id(fut) in deferred:
+            deferred = self._deferred_resume_set()
+            if fut in deferred:
                 return
-            deferred.add(id(fut))
+            deferred.add(fut)
             # Track the deferred /resume itself in _inflight_entries BEFORE `fut`
             # completes so no subsequent round can pass drain_inflight() and start
             # a new pause/update while this older deferred /resume is still pending.
@@ -570,7 +570,9 @@ class SkyrlWeightSyncClient:
         for url, endpoint, fut in futures:
             if not fut.done():
                 fut.cancel()
-            if fut.done() and not fut.cancelled():
+            if fut.cancelled():
+                first_exc = first_exc or TimeoutError(f"POST {url}{endpoint} exceeded weight-sync phase deadline")
+            elif fut.done():
                 try:
                     responses.append(fut.result())
                 except Exception as exc:  # noqa: BLE001
@@ -578,8 +580,10 @@ class SkyrlWeightSyncClient:
                         self._record_unconfirmed_lifecycle(url, endpoint, exc)
                     first_exc = first_exc or exc
             else:
-                if not fut.done():
-                    timed_out.append((url, endpoint, fut))
+                # Register unconditionally (never re-check fut.done() here); if `fut`
+                # completes concurrently right after this check, _prune_done_inflight()
+                # will inspect its actual result and record any unconfirmed error.
+                timed_out.append((url, endpoint, fut))
                 first_exc = first_exc or TimeoutError(f"POST {url}{endpoint} exceeded weight-sync phase deadline")
         if timed_out:
             with _CONTROL_PLANE_LOCK:
