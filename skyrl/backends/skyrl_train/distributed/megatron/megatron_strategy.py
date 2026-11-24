@@ -36,6 +36,7 @@ from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
     offload_megatron_grads_to_cpu,
     offload_megatron_model_to_cpu,
     offload_megatron_optimizer,
+    validate_shared_outer_adapter_export_supported,
 )
 from skyrl.backends.skyrl_train.distributed.megatron.optimizer_offload_to_disk import (
     CHECKPOINT_SUBDIR as OFFLOAD_TO_DISK_CHECKPOINT_SUBDIR,
@@ -798,6 +799,8 @@ class MegatronStrategy(DistributedStrategy):
                 )
             if expand_shared_outer and allow_serving_layout:
                 raise ValueError("expand_shared_outer and allow_serving_layout cannot both be True.")
+            if getattr(peft_config, "experts_shared_outer_loras", False) is True:
+                validate_shared_outer_adapter_export_supported(bridge)
         elif expand_shared_outer or allow_serving_layout:
             raise ValueError(
                 "expand_shared_outer and allow_serving_layout require lora_export_format to be 'adapter' or 'both'."

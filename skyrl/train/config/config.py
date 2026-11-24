@@ -468,13 +468,17 @@ class MegatronHFExportConfig(BaseConfig):
     """Passed to ``AutoBridge.save_hf_adapter`` for shared-outer MoE LoRA
     (``lora_config.experts_shared_outer_loras=True``): replicate the shared factor across experts
     under per-expert names so ``PeftModel.from_pretrained`` can load the exported adapter.
+    Supported for per-expert HF layouts only; checkpoints with packed HF expert weights
+    (``experts.gate_up_proj`` / ``experts.down_proj``) are rejected at worker init.
     Mutually exclusive with ``allow_serving_layout``; only valid with
     ``lora_export_format`` set to ``"adapter"`` or ``"both"``."""
     allow_serving_layout: bool = False
     """Passed to ``AutoBridge.save_hf_adapter`` for shared-outer MoE LoRA
     (``lora_config.experts_shared_outer_loras=True``): write the compact serving layout (the shared
     factor once as ``[1, ...]`` next to its per-expert partner) instead of raising. Not loadable by
-    ``PeftModel.from_pretrained``. Mutually exclusive with ``expand_shared_outer``; only valid with
+    ``PeftModel.from_pretrained``. Supported for per-expert HF layouts only; checkpoints with packed
+    HF expert weights (``experts.gate_up_proj`` / ``experts.down_proj``) are rejected at worker init.
+    Mutually exclusive with ``expand_shared_outer``; only valid with
     ``lora_export_format`` set to ``"adapter"`` or ``"both"``."""
 
     def __post_init__(self) -> None:

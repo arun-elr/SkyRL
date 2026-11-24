@@ -44,6 +44,7 @@ from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
     get_model_config,
     get_moe_metrics,
     print_model_size,
+    validate_shared_outer_adapter_export_supported,
 )
 from skyrl.backends.skyrl_train.distributed.megatron.optimizer import (
     get_megatron_optimizer,
@@ -655,6 +656,9 @@ class MegatronWorker:
             multi_latent_attention=bool(getattr(self.provider, "multi_latent_attention", False)),
         )
         if experts_shared_outer_loras:
+            hf_export = getattr(self.megatron_config, "hf_export_config", None)
+            if getattr(hf_export, "lora_export_format", "merged") in ("adapter", "both"):
+                validate_shared_outer_adapter_export_supported(self.bridge)
             apply_packed_per_expert_sharded_state_dict_patch()
         normalize_moe_lora = self.cfg.policy.megatron_config.lora_config.normalize_moe_lora
         # TODO: We should improve test coverage for this normalization logic and add a GPU-based integration test

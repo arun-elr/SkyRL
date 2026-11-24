@@ -191,8 +191,8 @@ merged weights.
 
 `trainer.policy.megatron_config.hf_export_config.expand_shared_outer`
   - **Default**: `false`
-  - **Purpose**: For shared-outer MoE LoRA (`lora_config.experts_shared_outer_loras=true`), replicate the shared factor across experts under per-expert names so `PeftModel.from_pretrained` can load the adapter. Mutually exclusive with `allow_serving_layout`.
+  - **Purpose**: For shared-outer MoE LoRA (`lora_config.experts_shared_outer_loras=true`), replicate the shared factor across experts under per-expert names so `PeftModel.from_pretrained` can load the adapter. Per-expert HF layouts only (checkpoints with packed HF expert weights such as `experts.gate_up_proj` / `experts.down_proj` are rejected). Mutually exclusive with `allow_serving_layout`.
 
 `trainer.policy.megatron_config.hf_export_config.allow_serving_layout`
   - **Default**: `false`
-  - **Purpose**: For shared-outer MoE LoRA, keep the compact `[1, ...]` serving layout instead of expanding across experts. Not loadable by `PeftModel.from_pretrained`. Mutually exclusive with `expand_shared_outer`.
+  - **Purpose**: For shared-outer MoE LoRA, keep the compact `[1, ...]` serving layout instead of expanding across experts. Not loadable by `PeftModel.from_pretrained`. Per-expert HF layouts only (packed HF expert checkpoints are rejected). Mutually exclusive with `expand_shared_outer`.

@@ -364,6 +364,76 @@ def gdn_in_proj_lora_is_safe(bridge) -> bool:
     return isinstance(mapping.hf_param, dict) and set(mapping.hf_param) == {"qkv", "z", "b", "a"}
 
 
+def _resolve_hf_param_names(mapping) -> set[str]:
+    hf_param = mapping.hf_param
+    if isinstance(hf_param, str):
+        return {hf_param}
+    if isinstance(hf_param, dict):
+        return set(hf_param.values())
+    return set()
+
+
+def _substitute_expert_wildcard(pattern: str, expert_idx: int) -> Optional[str]:
+    """Instantiate a routed-expert Megatron mapping pattern at layer 0 and ``expert_idx``."""
+    if ".experts." not in pattern:
+        return None
+    if pattern.endswith(".weight*"):
+        prefix = pattern[: -len(".weight*")].replace("**", "0").replace("*", "0")
+        return f"{prefix}.weight{expert_idx}"
+    if ".local_experts.*." in pattern:
+        head, tail = pattern.split(".local_experts.*.", 1)
+        head = head.replace("**", "0").replace("*", "0")
+        tail = tail.replace("**", "0").replace("*", "0")
+        return f"{head}.local_experts.{expert_idx}.{tail}"
+    return None
+
+
+def has_packed_hf_expert_mappings(bridge) -> bool:
+    """Whether ``bridge`` maps multiple Megatron routed experts onto one packed HF tensor.
+
+    For checkpoints with packed HF expert weights (e.g. ``experts.gate_up_proj`` /
+    ``experts.down_proj`` on Qwen3.5/3.6 MoE), different Megatron expert indices
+    (``.weight0`` vs ``.weight1``) resolve to the same HF parameter name. Pinned
+    Megatron-Bridge's ``save_hf_adapter`` with shared-outer MoE LoRA emits each
+    expert's 2D slice under that shared HF name, so PEFT dict conversion overwrites
+    all earlier experts (under ``expand_shared_outer=True``) or fails partner
+    validation (under ``allow_serving_layout=True``).
+    """
+    model_bridge = getattr(bridge, "_model_bridge", None)
+    if model_bridge is None or not hasattr(model_bridge, "mapping_registry"):
+        return False
+    if hasattr(bridge, "hf_pretrained"):
+        model_bridge.hf_pretrained = bridge.hf_pretrained
+    registry = model_bridge.mapping_registry()
+    for mapping in getattr(registry, "mappings", ()):
+        mp = getattr(mapping, "megatron_param", "")
+        if not isinstance(mp, str):
+            continue
+        sample_0 = _substitute_expert_wildcard(mp, 0)
+        if sample_0 is None:
+            continue
+        sample_1 = _substitute_expert_wildcard(mp, 1)
+        m0 = registry.megatron_to_hf_lookup(sample_0)
+        m1 = registry.megatron_to_hf_lookup(sample_1)
+        if m0 is None or m1 is None:
+            continue
+        if _resolve_hf_param_names(m0) & _resolve_hf_param_names(m1):
+            return True
+    return False
+
+
+def validate_shared_outer_adapter_export_supported(bridge) -> None:
+    """Reject shared-outer LoRA HF adapter export on bridges with packed HF expert weights."""
+    if has_packed_hf_expert_mappings(bridge):
+        raise ValueError(
+            "LoRA adapter HF export (`hf_export_config.lora_export_format` in ('adapter', 'both')) "
+            "with `experts_shared_outer_loras=True` is not supported for checkpoints with packed HF "
+            "expert weights (e.g. `experts.gate_up_proj` / `experts.down_proj`): Megatron-Bridge's "
+            "`save_hf_adapter` emits each expert under the same HF key and drops earlier experts. "
+            "Use `lora_export_format='merged'` or disable `experts_shared_outer_loras`."
+        )
+
+
 @torch.no_grad()
 def offload_megatron_grads_to_cpu(models):
     for model_chunk in models:
