@@ -2054,6 +2054,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             control_plane_timeout_budget,
             rank0_phase_timeout_s,
         )
+        from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+            weight_sync_client_timeout,
+        )
 
         if not isinstance(inference_engine_client, RemoteInferenceClient):
             raise TypeError("lora.sync_mode='memory' requires the RemoteInferenceClient (new inference path)")
@@ -2096,7 +2099,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # opens the round trip, the others only join its collectives.
             barrier_with_error_propagation(arm_error, stage="in-memory LoRA receive target setup")
 
-            with self._expandable_segments_disabled_for_sync(force=engine.skyrl_force_disable_expandable_segments):
+            with (
+                self._expandable_segments_disabled_for_sync(force=engine.skyrl_force_disable_expandable_segments),
+                weight_sync_client_timeout(phase_budget),
+            ):
                 try:
                     await self._await_weight_sync_thread(engine.send_weights)
                 except (Exception, asyncio.CancelledError) as exc:
@@ -2178,13 +2184,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             adapter_target_modules,
         )
 
-        # Every rank must participate in the bridge's collective export, but only
-        # the writer ranks materialize the gathered tensors: with MoE expert
-        # adapters the full adapter state can reach tens of GB (per-expert
-        # replication), and keeping a copy on all ranks multiplies the CPU
-        # spike by ranks-per-node (enough to OOM a node during sync). `cpu`
-        # only gates the bridge's trailing device-to-host copy (not its
-        # collectives), so non-writers skip that copy for tensors they discard.
+        # Export with cpu=False on every rank so Megatron-Bridge never performs
+        # writer-only CPU copies inside the iterator before yielding (where a
+        # host OOM would escape before collectives finish). Writer ranks copy
+        # each yielded tensor to CPU inside the guarded block below, and on
+        # error keep draining the iterator so all ranks stay aligned on
+        # collectives until the barrier exchanges the failure.
         keep_state = self._is_lora_sync_writer_rank()
         # Shared-outer grouped-expert LoRA emits the per-expert side of packed-HF
         # models (e.g. Qwen3.5/3.6 MoE) as one 2D slice per expert under the same
@@ -2192,14 +2197,16 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # and stack them back into the (E, out, in) layout the converter expects.
         adapter_tensor_lists: Dict[str, List[torch.Tensor]] = {}
         write_error: Optional[BaseException] = None
-        for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=keep_state, show_progress=False):
+        for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=False, show_progress=False):
             if keep_state and write_error is None:
                 try:
                     # Keep the training dtype (bf16): upcasting to float32 doubles
                     # the already-large per-expert adapter state (and the file the
                     # engines re-read every step) for no fidelity gain -- vLLM casts
                     # adapters to its lora dtype on load.
-                    adapter_tensor_lists.setdefault(f"base_model.model.{name}", []).append(tensor.clone())
+                    adapter_tensor_lists.setdefault(f"base_model.model.{name}", []).append(
+                        tensor.detach().to(device="cpu", copy=True)
+                    )
                 except Exception as exc:
                     # Finish draining export_adapter_weights so collectives stay aligned,
                     # then propagate the failure to peers at the barrier below.

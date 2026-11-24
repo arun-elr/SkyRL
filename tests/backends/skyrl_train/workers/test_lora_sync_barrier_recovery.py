@@ -1087,7 +1087,8 @@ def _worker_megatron_send_failure_disarms_real_receivers(
                 recv.skyrl_set_lora_receive_target(json["kwargs"]["receive_target"])
                 return url, {"status": 200, "body": {}}
             if method_name == "skyrl_clear_lora_receive_target":
-                recv.skyrl_clear_lora_receive_target()
+                round_id = (json.get("kwargs") or {}).get("round_id")
+                recv.skyrl_clear_lora_receive_target(round_id=round_id)
                 return url, {"status": 200, "body": {}}
             raise AssertionError(f"Unexpected method {method_name}")
 
@@ -1174,3 +1175,268 @@ async def test_failed_disarm_reported_blocks_reuse_until_recovery():
         "http://server-a:8000": "tenant-b",
         "http://server-b:8001": "tenant-b",
     }
+
+
+def _worker_blocking_client_stalled_finish_recovers_gloo(rank: int, world_size: int, store_path: str) -> None:
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+        rank0_phase_timeout_s,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+        START_UPDATE_ENDPOINT,
+        SkyrlWeightSyncClient,
+        weight_sync_client_timeout,
+    )
+    from skyrl.backends.skyrl_train.workers.worker_utils import exchange_rank_errors
+
+    pg_timeout_s = 2.5
+    _init_gloo_group(rank, world_size, store_path, timeout_s=pg_timeout_s)
+    try:
+        stalled = {"flag": True}
+
+        class _Resp:
+            status_code = 200
+            reason = "OK"
+            text = "{}"
+
+            def json(self):
+                return {"status": "ok"}
+
+        class _BlockingSession:
+            def post(self, url, json=None, timeout=None):
+                if url.endswith("/finish_weight_update") and stalled["flag"]:
+                    # Respect socket timeout if smaller, otherwise stall far past Gloo's 2.5s timeout.
+                    time.sleep(min(timeout, 30.0) if timeout is not None else 30.0)
+                    raise TimeoutError("simulated read timeout")
+                return _Resp()
+
+            def close(self):
+                pass
+
+        client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+        client._urls = ["http://server-0:8000"]
+        client._dp = 1
+        client._init_payload_fn = None
+        client._timeout_s = None
+        client._start_endpoint = START_UPDATE_ENDPOINT
+        client._session = _BlockingSession()
+        client._pool = ThreadPoolExecutor(max_workers=1)
+
+        try:
+            # Round 1: rank 0 stalls in blocking /finish_weight_update while rank 1 returns early
+            # into exchange_rank_errors. Timeout must fire strictly below the 2.5s Gloo PG timeout.
+            started = time.monotonic()
+            send_error = None
+            if rank == 0:
+                with weight_sync_client_timeout(rank0_phase_timeout_s(pg_timeout_s)):
+                    try:
+                        client.finish_weight_update()
+                    except Exception as exc:
+                        send_error = exc
+            any_failed, peer_err = exchange_rank_errors(send_error)
+            elapsed = time.monotonic() - started
+            assert elapsed < pg_timeout_s
+            assert any_failed is True
+            if rank == 0:
+                assert isinstance(send_error, TimeoutError)
+            else:
+                assert peer_err is not None and peer_err[0] == 0
+
+            # Round 2: server recovers; same Gloo PG and blocking client both succeed.
+            stalled["flag"] = False
+            send_error = None
+            if rank == 0:
+                with weight_sync_client_timeout(rank0_phase_timeout_s(pg_timeout_s)):
+                    client.finish_weight_update()
+            barrier_with_error_propagation(send_error, stage="blocking finish recovery")
+        finally:
+            client._pool.shutdown(wait=False)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_blocking_weight_sync_client_stalled_finish_recovers_gloo_group(tmp_path):
+    _run_mp(_worker_blocking_client_stalled_finish_recovers_gloo, 2, tmp_path)
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_late_server_arm_and_clear_protected_by_round_id():
+    """Delayed server-side clear/arm tasks that continue after client timeout cannot corrupt later rounds."""
+    from skyrl.backends.skyrl_train.weight_sync.lora_target import (
+        build_lora_receive_target,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.weight_receivers import (
+        SkyrlLoraStagingMixin,
+    )
+
+    class _RealReceiver(SkyrlLoraStagingMixin):
+        vllm_config = SimpleNamespace(lora_config=object())
+
+    receiver = _RealReceiver()
+    client = RemoteInferenceClient.__new__(RemoteInferenceClient)
+    client.server_urls = ["http://server-0:8000"]
+
+    late_tasks: list[asyncio.Task] = []
+    release_late_clear = asyncio.Event()
+    release_late_arm = asyncio.Event()
+    mode = {"scenario": "delay_clear"}
+    late_arm_rejected = {"error": None}
+
+    async def _fake_call_server(url: str, endpoint: str, json=None, method="POST", params=None):
+        method_name = json["method"]
+        kwargs = json.get("kwargs") or {}
+        if method_name == "skyrl_set_lora_receive_target":
+            target = kwargs["receive_target"]
+            if mode["scenario"] == "delay_arm" and target["lora_name"] == "tenant-c":
+                # Independent server task that continues even after client times out/cancels.
+                async def _server_apply_late_arm():
+                    await release_late_arm.wait()
+                    try:
+                        receiver.skyrl_set_lora_receive_target(target)
+                    except Exception as exc:
+                        late_arm_rejected["error"] = exc
+
+                late_tasks.append(asyncio.create_task(_server_apply_late_arm()))
+                await asyncio.sleep(30.0)
+            receiver.skyrl_set_lora_receive_target(target)
+            return url, {"status": 200, "body": {}}
+
+        if method_name == "skyrl_clear_lora_receive_target":
+            rid = kwargs.get("round_id")
+            if mode["scenario"] == "delay_clear":
+                mode["scenario"] = "normal"
+
+                # Independent server task that applies the stale clear AFTER tenant-b arms.
+                async def _server_apply_late_clear():
+                    await release_late_clear.wait()
+                    receiver.skyrl_clear_lora_receive_target(round_id=rid)
+
+                late_tasks.append(asyncio.create_task(_server_apply_late_clear()))
+                await asyncio.sleep(30.0)
+            receiver.skyrl_clear_lora_receive_target(round_id=rid)
+            return url, {"status": 200, "body": {}}
+
+        raise AssertionError(f"Unexpected method {method_name}")
+
+    client._call_server = _fake_call_server
+
+    # Scenario A: tenant-a's clear times out on client while continuing independently on the server.
+    # Preflight clear + tenant-b arm run first, then tenant-a's stale clear arrives on the server.
+    await client.set_lora_receive_target(build_lora_receive_target("tenant-a", {}, {}), timeout_s=1.0)
+    assert receiver.skyrl_lora_armed() is True
+    failed = await client.clear_lora_receive_target(timeout_s=0.15)
+    assert "http://server-0:8000" in failed
+
+    # Preflight clears tenant-a cleanly, then arms tenant-b.
+    await client.set_lora_receive_target(build_lora_receive_target("tenant-b", {}, {}), timeout_s=1.0)
+    assert receiver._skyrl_lora_target["lora_name"] == "tenant-b"
+
+    # Now release the stale clear from tenant-a's round: it must NOT disarm tenant-b.
+    release_late_clear.set()
+    await asyncio.gather(*late_tasks)
+    late_tasks.clear()
+    assert receiver.skyrl_lora_armed() is True
+    assert receiver._skyrl_lora_target["lora_name"] == "tenant-b"
+
+    # Disarm tenant-b cleanly before Scenario B.
+    assert await client.clear_lora_receive_target(timeout_s=1.0) == {}
+    assert receiver.skyrl_lora_armed() is False
+
+    # Scenario B: tenant-c's arm times out on client while continuing independently on the server;
+    # rollback clear lands on server first, then the delayed arm arrives and must be rejected.
+    mode["scenario"] = "delay_arm"
+    with pytest.raises(InferenceServerTimeoutError):
+        await client.set_lora_receive_target(build_lora_receive_target("tenant-c", {}, {}), timeout_s=0.25)
+
+    release_late_arm.set()
+    await asyncio.gather(*late_tasks)
+    late_tasks.clear()
+    assert isinstance(late_arm_rejected["error"], RuntimeError)
+    assert "already cancelled" in str(late_arm_rejected["error"])
+    assert receiver.skyrl_lora_armed() is False
+
+    # Tenant-d can now arm cleanly.
+    mode["scenario"] = "normal"
+    await client.set_lora_receive_target(build_lora_receive_target("tenant-d", {}, {}), timeout_s=1.0)
+    assert receiver._skyrl_lora_target["lora_name"] == "tenant-d"
+
+
+def _worker_megatron_export_copy_failure_drains_collectives(
+    rank: int, world_size: int, store_path: str, sync_dir: str
+) -> None:
+    from megatron.bridge.models.conversion import peft_bridge
+
+    _init_gloo_group(rank, world_size, store_path)
+    orig_empty_cache = torch.cuda.empty_cache
+    orig_build_cfg = peft_bridge.build_adapter_config_dict
+    try:
+        torch.cuda.empty_cache = lambda: None
+        peft_bridge.build_adapter_config_dict = lambda lora_cls, target_modules, base_model_name_or_path: {
+            "r": lora_cls.dim,
+            "lora_alpha": lora_cls.alpha,
+            "target_modules": list(target_modules),
+            "base_model_name_or_path": base_model_name_or_path,
+        }
+
+        worker = _make_megatron_lora_worker(sync_dir, sync_mode="disk")
+        ie_cfg = SimpleNamespace(enable_prefix_caching=False)
+        fail_first = {"flag": True}
+        seen_cpu_args = []
+        second_collective_reached = {"count": 0}
+
+        class _FailingCopyTensor:
+            def detach(self):
+                return self
+
+            def to(self, *args, **kwargs):
+                raise MemoryError("simulated host OOM during writer-only CPU copy")
+
+        def _export_with_collective(actor_module, cpu=True, show_progress=False):
+            seen_cpu_args.append(cpu)
+            if fail_first["flag"] and rank == 0:
+                yield ("layers.0.self_attn.q_proj.lora_A.weight", _FailingCopyTensor())
+            else:
+                yield ("layers.0.self_attn.q_proj.lora_A.weight", torch.ones(4, 8, dtype=torch.bfloat16))
+            # A second collective remains in the stream after the first tensor fails on rank 0.
+            dist.barrier()
+            second_collective_reached["count"] += 1
+            yield ("layers.0.self_attn.q_proj.lora_B.weight", torch.ones(8, 4, dtype=torch.bfloat16))
+
+        worker.bridge.export_adapter_weights = _export_with_collective
+
+        client = Mock(spec=RemoteInferenceClient)
+        client.load_lora_adapter = AsyncMock()
+
+        async def _run():
+            # Round 1: writer rank hits MemoryError copying tensor 1 to CPU, must still drain
+            # tensor 2's collective barrier without deadlocking peer rank 1.
+            if rank == 0:
+                with pytest.raises(MemoryError, match="host OOM"):
+                    await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="model_1")
+                client.load_lora_adapter.assert_not_awaited()
+            else:
+                await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="model_1")
+
+            assert second_collective_reached["count"] == 1
+            assert seen_cpu_args == [False]
+
+            # Round 2: export succeeds on both ranks on the same Gloo PG.
+            fail_first["flag"] = False
+            await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="model_2")
+            assert second_collective_reached["count"] == 2
+            if rank == 0:
+                client.load_lora_adapter.assert_awaited_once()
+
+        asyncio.run(_run())
+    finally:
+        torch.cuda.empty_cache = orig_empty_cache
+        peft_bridge.build_adapter_config_dict = orig_build_cfg
+        dist.destroy_process_group()
+
+
+@pytest.mark.megatron
+def test_megatron_disk_export_copy_failure_drains_remaining_collectives(tmp_path):
+    _run_mp(_worker_megatron_export_copy_failure_drains_collectives, 2, tmp_path, str(tmp_path / "lora_sync"))

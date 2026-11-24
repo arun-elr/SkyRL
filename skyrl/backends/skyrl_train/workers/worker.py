@@ -712,6 +712,12 @@ class Worker(DistributedTorchRayActor):
         * the ``expandable_segments`` toggle, a trainer-process allocator setting;
         * ``empty_cache`` afterwards.
         """
+        from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+            rank0_phase_timeout_s,
+        )
+        from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+            weight_sync_client_timeout,
+        )
         from skyrl.backends.skyrl_train.weight_sync.weight_senders import (
             maybe_set_reset_prefix_cache,
         )
@@ -731,7 +737,10 @@ class Worker(DistributedTorchRayActor):
             # engines (sharded_rdt) share GPU memory on every run and ask for the
             # toggle unconditionally.
             sync_error: Optional[BaseException] = None
-            with self._expandable_segments_disabled_for_sync(force=engine.skyrl_force_disable_expandable_segments):
+            with (
+                self._expandable_segments_disabled_for_sync(force=engine.skyrl_force_disable_expandable_segments),
+                weight_sync_client_timeout(rank0_phase_timeout_s()),
+            ):
                 try:
                     await self._await_weight_sync_thread(engine.send_weights)
                 except (Exception, asyncio.CancelledError) as exc:

@@ -171,6 +171,15 @@ class SkyrlLoraStagingMixin:
     # these engines through the base __init__, which SkyRL does not override.
     _skyrl_lora_target: dict[str, Any] | None = None
     _skyrl_lora_staged: dict[str, torch.Tensor] | None = None
+    _skyrl_lora_cancelled_rounds: dict[str, None] | None = None
+    _SKYRL_MAX_CANCELLED_ROUNDS = 1024
+
+    def _cancelled_lora_rounds(self) -> dict[str, None]:
+        rounds = self._skyrl_lora_cancelled_rounds
+        if rounds is None:
+            rounds = {}
+            self._skyrl_lora_cancelled_rounds = rounds
+        return rounds
 
     def skyrl_set_lora_receive_target(self, receive_target: dict[str, Any]) -> None:
         """Arm the next update round to build the named adapter."""
@@ -180,6 +189,9 @@ class SkyrlLoraStagingMixin:
 
         if not is_lora_receive_target(receive_target):
             raise ValueError(f"Not a LoRA receive target: {receive_target!r}")
+        round_id = receive_target.get("round_id")
+        if round_id is not None and round_id in self._cancelled_lora_rounds():
+            raise RuntimeError(f"LoRA receive target round {round_id!r} was already cancelled; ignoring late arm.")
         if self._skyrl_lora_target is not None:
             raise RuntimeError(
                 f"A LoRA receive target is already armed for "
@@ -199,8 +211,21 @@ class SkyrlLoraStagingMixin:
     def skyrl_lora_armed(self) -> bool:
         return self._skyrl_lora_target is not None
 
-    def skyrl_clear_lora_receive_target(self) -> None:
-        """Disarm a previously armed LoRA receive target (e.g. after a partial setup failure)."""
+    def skyrl_clear_lora_receive_target(self, round_id: str | None = None) -> None:
+        """Disarm a previously armed LoRA receive target (e.g. after a partial setup failure).
+
+        When ``round_id`` is provided, records the round as cancelled (rejecting
+        any late-arriving arm for that round) and only disarms if the currently
+        armed target matches ``round_id``, so a delayed clear from an earlier
+        failed round can never wipe a newer tenant's receive target.
+        """
+        if round_id is not None:
+            cancelled = self._cancelled_lora_rounds()
+            cancelled[round_id] = None
+            while len(cancelled) > self._SKYRL_MAX_CANCELLED_ROUNDS:
+                cancelled.pop(next(iter(cancelled)))
+            if self._skyrl_lora_target is not None and self._skyrl_lora_target.get("round_id") != round_id:
+                return
         self._skyrl_lora_target = None
         self._skyrl_lora_staged = None
 

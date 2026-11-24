@@ -28,8 +28,11 @@ pays for it.
 """
 
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -46,6 +49,19 @@ if TYPE_CHECKING:
     from requests import Response
 
 logger = logging.getLogger(__name__)
+
+_WEIGHT_SYNC_HTTP_TIMEOUT_S: ContextVar[Optional[float]] = ContextVar("_WEIGHT_SYNC_HTTP_TIMEOUT_S", default=None)
+
+
+@contextmanager
+def weight_sync_client_timeout(timeout_s: Optional[float]) -> Iterator[None]:
+    """Bound blocking ``SkyrlWeightSyncClient`` HTTP fan-out calls inside this block."""
+    token = _WEIGHT_SYNC_HTTP_TIMEOUT_S.set(timeout_s)
+    try:
+        yield
+    finally:
+        _WEIGHT_SYNC_HTTP_TIMEOUT_S.reset(token)
+
 
 # vLLM dev-mode routes, plus /fetch_weights, which SkyRL adds in vllm_server_actor.
 INIT_ENGINE_ENDPOINT = "/init_weight_transfer_engine"
@@ -81,12 +97,14 @@ class SkyrlWeightSyncClient:
         data_parallel_size: int = 1,
         *,
         init_payload_fn: Optional[Callable[[Dict[str, Any], Sequence[str], int], List[Dict[str, Any]]]] = None,
+        timeout_s: Optional[float] = None,
     ) -> None:
         import requests  # local: Ray (a hard dep of every path reaching here) provides it.
 
         self._urls = list(server_urls)
         self._dp = max(1, int(data_parallel_size))
         self._init_payload_fn = init_payload_fn
+        self._timeout_s = timeout_s
         self._start_endpoint = START_UPDATE_ENDPOINT
         if not self._urls:
             raise ValueError("SkyrlWeightSyncClient requires at least one server_url.")
@@ -187,27 +205,50 @@ class SkyrlWeightSyncClient:
     def _fanout_uniform(self, endpoint: str, body: Optional[Dict[str, Any]]) -> List["Response"]:
         return self._fanout([(url, endpoint, body) for url in self._urls])
 
+    def _effective_timeout_s(self) -> Optional[float]:
+        ctx_timeout = _WEIGHT_SYNC_HTTP_TIMEOUT_S.get()
+        if ctx_timeout is not None:
+            return ctx_timeout if ctx_timeout > 0 else None
+        inst_timeout = getattr(self, "_timeout_s", None)
+        return inst_timeout if (inst_timeout is not None and inst_timeout > 0) else None
+
     def _fanout(self, calls: Sequence[Tuple[str, str, Optional[Dict[str, Any]]]]) -> List["Response"]:
         """POST to every server concurrently; raise the first failure after all
-        return.
+        return (or when the active timeout budget expires).
 
-        Every future is drained before raising, so a failure on one server never
-        leaves POSTs in flight against the others."""
-        futures = [self._pool.submit(self._post, url, endpoint, body) for url, endpoint, body in calls]
+        Every future is drained before raising (within the timeout budget when
+        set), so a failure on one server never leaves POSTs in flight against
+        the others."""
+        timeout_s = self._effective_timeout_s()
+        deadline_at = None if timeout_s is None else (time.monotonic() + timeout_s)
+        futures = [
+            (url, endpoint, self._pool.submit(self._post, url, endpoint, body, timeout_s))
+            for url, endpoint, body in calls
+        ]
         responses = []
         first_exc: Optional[BaseException] = None
-        for fut in futures:
+        for url, endpoint, fut in futures:
             try:
-                responses.append(fut.result())
+                remaining = None if deadline_at is None else max(0.0, deadline_at - time.monotonic())
+                responses.append(fut.result(timeout=remaining))
+            except FuturesTimeoutError:
+                fut.cancel()
+                first_exc = first_exc or TimeoutError(f"POST {url}{endpoint} did not complete within {timeout_s:g}s")
             except Exception as exc:  # noqa: BLE001
                 first_exc = first_exc or exc
         if first_exc is not None:
             raise first_exc
         return responses
 
-    def _post(self, url: str, endpoint: str, body: Optional[Dict[str, Any]]) -> "Response":
-        # No timeout, no retry -- see module docstring.
-        resp = self._session.post(f"{url}{endpoint}", json=body, timeout=None)
+    def _post(
+        self,
+        url: str,
+        endpoint: str,
+        body: Optional[Dict[str, Any]],
+        timeout_s: Optional[float] = None,
+    ) -> "Response":
+        # No retry; timeout defaults to None unless bounded by caller context (see module docstring).
+        resp = self._session.post(f"{url}{endpoint}", json=body, timeout=timeout_s)
         if resp.status_code >= 400:
             raise RuntimeError(_error_message(url, endpoint, resp))
         return resp

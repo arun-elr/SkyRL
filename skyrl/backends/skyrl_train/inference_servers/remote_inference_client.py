@@ -51,6 +51,7 @@ import contextlib
 import json
 import logging
 import time
+import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1607,12 +1608,15 @@ class RemoteInferenceClient(InferenceEngineInterface):
     # What is left here is what the driver drives: pause/resume, prefix-cache
     # reset, /fetch_weights, LoRA, and /get_world_size at init.
 
-    def _dirty_lora_servers(self) -> set[str]:
-        dirty = getattr(self, "_dirty_lora_target_servers", None)
+    def _dirty_lora_rounds(self) -> Dict[str, set[str]]:
+        dirty = getattr(self, "_dirty_lora_target_rounds", None)
         if dirty is None:
-            dirty = set()
-            self._dirty_lora_target_servers = dirty
+            dirty = {}
+            self._dirty_lora_target_rounds = dirty
         return dirty
+
+    def _dirty_lora_servers(self) -> set[str]:
+        return {url for url, rounds in self._dirty_lora_rounds().items() if rounds}
 
     def _resolve_lora_phase_budget(self, timeout_s: Optional[float]) -> Optional[float]:
         """Return a total phase budget strictly below the worker PG timeout."""
@@ -1630,11 +1634,14 @@ class RemoteInferenceClient(InferenceEngineInterface):
         self,
         server_urls: List[str],
         *,
+        round_id: Optional[str],
         budget_s: Optional[float],
     ) -> Tuple[Dict[str, BaseException], bool]:
         if not server_urls:
             return {}, False
-        payload = {"method": "skyrl_clear_lora_receive_target"}
+        payload: Dict[str, Any] = {"method": "skyrl_clear_lora_receive_target"}
+        if round_id is not None:
+            payload["kwargs"] = {"round_id": round_id}
         with control_plane_timeout_budget(budget_s):
             responses, errors, cancelled = await _run_bounded_fanout(
                 [(url, self._call_server(url, "/collective_rpc", payload)) for url in server_urls],
@@ -1642,11 +1649,18 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 method="POST",
                 endpoint="/collective_rpc",
             )
-        dirty = self._dirty_lora_servers()
+        dirty = self._dirty_lora_rounds()
+        round_key = round_id if round_id is not None else ""
         for url in responses:
-            dirty.discard(url)
+            if url in dirty:
+                if round_id is None:
+                    dirty.pop(url, None)
+                else:
+                    dirty[url].discard(round_key)
+                    if not dirty[url]:
+                        dirty.pop(url, None)
         for url in errors:
-            dirty.add(url)
+            dirty.setdefault(url, set()).add(round_key)
         if errors:
             details = ", ".join(f"{url}: {type(exc).__name__}: {exc}" for url, exc in errors.items())
             logger.warning(
@@ -1658,16 +1672,22 @@ class RemoteInferenceClient(InferenceEngineInterface):
         self,
         server_urls: Optional[List[str]] = None,
         *,
+        round_id: Optional[str] = None,
         timeout_s: Optional[float] = None,
     ) -> Dict[str, BaseException]:
         """Disarm LoRA receive targets within ``timeout_s`` and return any per-server errors.
 
-        Servers whose clear fails or times out are tracked so the next
+        When ``round_id`` is omitted, uses the most recently armed round token
+        (if any) so delayed clears cannot disarm a newer tenant's round. Servers
+        whose clear fails or times out are tracked so the next
         ``set_lora_receive_target`` requires a successful disarm before arming again.
         """
         urls = list(self.server_urls if server_urls is None else server_urls)
+        effective_round = round_id if round_id is not None else getattr(self, "_last_lora_round_id", None)
         budget_s = self._resolve_lora_phase_budget(timeout_s)
-        errors, cancelled = await self._clear_lora_receive_target_bounded(urls, budget_s=budget_s)
+        errors, cancelled = await self._clear_lora_receive_target_bounded(
+            urls, round_id=effective_round, budget_s=budget_s
+        )
         if cancelled:
             raise asyncio.CancelledError()
         return errors
@@ -1686,10 +1706,12 @@ class RemoteInferenceClient(InferenceEngineInterface):
         ``/collective_rpc``, and must land before the trainer calls
         ``send_weights()`` (see ``weight_sync/lora_target.py``).
 
-        The entire phase (preflight disarm of any previously dirty servers, arm
-        fan-out, and rollback on failure/cancellation) is bounded strictly below
-        the worker process-group timeout so peer ranks never time out in Gloo
-        while waiting for rank 0's error exchange.
+        Each call stamps a unique ``round_id`` token so rollbacks and preflight
+        clears are conditional on that round and servers reject late arms from
+        cancelled rounds. The entire phase (preflight disarm, arm fan-out, and
+        rollback on failure/cancellation) is bounded strictly below the worker
+        process-group timeout so peer ranks never time out in Gloo while waiting
+        for rank 0's error exchange.
         """
         total_budget = self._resolve_lora_phase_budget(timeout_s)
         phase_deadline = None if total_budget is None else (time.monotonic() + total_budget)
@@ -1697,14 +1719,23 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
         # Require successful bounded cleanup of any server whose prior disarm failed
         # before arming any server for a new tenant.
-        dirty = self._dirty_lora_servers()
-        dirty_urls = [url for url in self.server_urls if url in dirty]
-        if dirty_urls:
-            preflight_budget = None if phase_deadline is None else max(0.05, (phase_deadline - time.monotonic()) * 0.4)
-            preflight_errors, preflight_cancelled = await self._clear_lora_receive_target_bounded(
-                dirty_urls, budget_s=preflight_budget
-            )
-            cancelled = cancelled or preflight_cancelled
+        dirty = self._dirty_lora_rounds()
+        pending_rounds_by_id: Dict[Optional[str], List[str]] = {}
+        for url in self.server_urls:
+            for dirty_round in list(dirty.get(url, ())):
+                rid = dirty_round or None
+                pending_rounds_by_id.setdefault(rid, []).append(url)
+        if pending_rounds_by_id:
+            preflight_errors: Dict[str, BaseException] = {}
+            for dirty_rid, urls in pending_rounds_by_id.items():
+                preflight_budget = (
+                    None if phase_deadline is None else max(0.05, (phase_deadline - time.monotonic()) * 0.4)
+                )
+                errs, pf_cancelled = await self._clear_lora_receive_target_bounded(
+                    urls, round_id=dirty_rid, budget_s=preflight_budget
+                )
+                cancelled = cancelled or pf_cancelled
+                preflight_errors.update(errs)
             if preflight_errors:
                 details = ", ".join(f"{url}: {type(exc).__name__}: {exc}" for url, exc in preflight_errors.items())
                 err = RuntimeError(
@@ -1724,7 +1755,12 @@ class RemoteInferenceClient(InferenceEngineInterface):
             rollback_reserve = min(remaining * 0.25, 30.0)
             arm_budget = max(0.05, remaining - rollback_reserve)
 
-        payload = {"method": "skyrl_set_lora_receive_target", "kwargs": {"receive_target": receive_target}}
+        target_with_round = dict(receive_target)
+        round_id = str(target_with_round.get("round_id") or uuid.uuid4().hex)
+        target_with_round["round_id"] = round_id
+        self._last_lora_round_id = round_id
+
+        payload = {"method": "skyrl_set_lora_receive_target", "kwargs": {"receive_target": target_with_round}}
         with deadline.operation("/collective_rpc"), control_plane_timeout_budget(arm_budget):
             responses, errors, arm_cancelled = await _run_bounded_fanout(
                 [(url, self._call_server(url, "/collective_rpc", payload)) for url in self.server_urls],
@@ -1736,12 +1772,12 @@ class RemoteInferenceClient(InferenceEngineInterface):
         first_error = next(iter(errors.values()), None)
 
         if cancelled or first_error is not None:
-            # Disarm every contacted server (including any that timed out or
-            # failed after arming a subset of workers) within the remaining phase
-            # budget so rollback never pushes rank 0 past the worker PG timeout.
+            # Disarm every contacted server for this round_id within the remaining
+            # phase budget so rollback never pushes rank 0 past the worker PG timeout
+            # and a delayed clear cannot affect a later round.
             rollback_budget = None if phase_deadline is None else max(0.05, phase_deadline - time.monotonic())
             clear_errors, clear_cancelled = await self._clear_lora_receive_target_bounded(
-                list(self.server_urls), budget_s=rollback_budget
+                list(self.server_urls), round_id=round_id, budget_s=rollback_budget
             )
             cancelled = cancelled or clear_cancelled
             if clear_errors and first_error is not None:
