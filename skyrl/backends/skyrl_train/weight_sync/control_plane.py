@@ -28,11 +28,12 @@ pays for it.
 """
 
 import logging
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+import weakref
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import contextmanager
-from contextvars import ContextVar
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -50,17 +51,58 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_WEIGHT_SYNC_HTTP_TIMEOUT_S: ContextVar[Optional[float]] = ContextVar("_WEIGHT_SYNC_HTTP_TIMEOUT_S", default=None)
+# Process-local deadline stack and client registry. Unlike a ContextVar, a
+# lock-protected process-local stack propagates into nested ThreadPoolExecutors
+# (such as vLLM's NCCLTrainerWeightTransferEngine, which submits update_weights
+# on its own worker pool) and shares one absolute monotonic deadline across all
+# sequential RPCs (start / update / finish) within a single weight-sync round.
+_CONTROL_PLANE_LOCK = threading.Lock()
+_WEIGHT_SYNC_DEADLINE_STACK: List[Optional[float]] = []
+_ACTIVE_CLIENTS: "weakref.WeakSet[SkyrlWeightSyncClient]" = weakref.WeakSet()
+
+
+@contextmanager
+def weight_sync_client_deadline(deadline_at: Optional[float]) -> Iterator[None]:
+    """Bind all blocking ``SkyrlWeightSyncClient`` calls in this process to one absolute deadline.
+
+    ``deadline_at`` is a ``time.monotonic()`` timestamp (or ``None`` for no
+    deadline). Applies across nested thread pools and sequential RPCs within
+    the block.
+    """
+    with _CONTROL_PLANE_LOCK:
+        _WEIGHT_SYNC_DEADLINE_STACK.append(deadline_at)
+    try:
+        yield
+    finally:
+        with _CONTROL_PLANE_LOCK:
+            _WEIGHT_SYNC_DEADLINE_STACK.pop()
 
 
 @contextmanager
 def weight_sync_client_timeout(timeout_s: Optional[float]) -> Iterator[None]:
-    """Bound blocking ``SkyrlWeightSyncClient`` HTTP fan-out calls inside this block."""
-    token = _WEIGHT_SYNC_HTTP_TIMEOUT_S.set(timeout_s)
-    try:
+    """Convenience wrapper converting a duration into an absolute ``weight_sync_client_deadline``."""
+    deadline_at = None if (timeout_s is None or timeout_s <= 0) else (time.monotonic() + timeout_s)
+    with weight_sync_client_deadline(deadline_at):
         yield
-    finally:
-        _WEIGHT_SYNC_HTTP_TIMEOUT_S.reset(token)
+
+
+def _current_process_deadline() -> Optional[float]:
+    with _CONTROL_PLANE_LOCK:
+        return _WEIGHT_SYNC_DEADLINE_STACK[-1] if _WEIGHT_SYNC_DEADLINE_STACK else None
+
+
+def drain_inflight_weight_sync_requests(deadline_at: Optional[float] = None) -> List[str]:
+    """Wait for any timed-out blocking weight-sync HTTP requests to settle up to ``deadline_at``.
+
+    Returns a list of ``"<url><endpoint>"`` strings for requests still running
+    when ``deadline_at`` expires (empty when all prior requests have settled).
+    """
+    with _CONTROL_PLANE_LOCK:
+        clients = list(_ACTIVE_CLIENTS)
+    still_running: List[str] = []
+    for client in clients:
+        still_running.extend(client.drain_inflight(deadline_at=deadline_at))
+    return still_running
 
 
 # vLLM dev-mode routes, plus /fetch_weights, which SkyRL adds in vllm_server_actor.
@@ -205,37 +247,103 @@ class SkyrlWeightSyncClient:
     def _fanout_uniform(self, endpoint: str, body: Optional[Dict[str, Any]]) -> List["Response"]:
         return self._fanout([(url, endpoint, body) for url in self._urls])
 
-    def _effective_timeout_s(self) -> Optional[float]:
-        ctx_timeout = _WEIGHT_SYNC_HTTP_TIMEOUT_S.get()
-        if ctx_timeout is not None:
-            return ctx_timeout if ctx_timeout > 0 else None
+    def _inflight_entries(self) -> List[Tuple[str, str, Future]]:
+        inflight = getattr(self, "_inflight_futures", None)
+        if inflight is None:
+            inflight = []
+            self._inflight_futures = inflight
+        return inflight
+
+    def _effective_deadline(self) -> Optional[float]:
+        proc_deadline = _current_process_deadline()
+        if proc_deadline is not None:
+            return proc_deadline
         inst_timeout = getattr(self, "_timeout_s", None)
-        return inst_timeout if (inst_timeout is not None and inst_timeout > 0) else None
+        if inst_timeout is not None and inst_timeout > 0:
+            return time.monotonic() + inst_timeout
+        return None
+
+    def drain_inflight(self, deadline_at: Optional[float] = None) -> List[str]:
+        """Drain previously timed-out POST futures on this client up to ``deadline_at``.
+
+        Returns descriptions of any futures still running past ``deadline_at``.
+        """
+        with _CONTROL_PLANE_LOCK:
+            pending = list(self._inflight_entries())
+            self._inflight_entries().clear()
+
+        still_running: List[Tuple[str, str, Future]] = []
+        for url, endpoint, fut in pending:
+            if fut.done():
+                try:
+                    fut.result()
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            remaining = None if deadline_at is None else max(0.0, deadline_at - time.monotonic())
+            if remaining is not None and remaining <= 0.0:
+                still_running.append((url, endpoint, fut))
+                continue
+            try:
+                fut.result(timeout=remaining)
+            except FuturesTimeoutError:
+                still_running.append((url, endpoint, fut))
+            except Exception:  # noqa: BLE001
+                pass
+
+        if still_running:
+            with _CONTROL_PLANE_LOCK:
+                self._inflight_entries().extend(still_running)
+        return [f"{url}{endpoint}" for url, endpoint, _ in still_running]
 
     def _fanout(self, calls: Sequence[Tuple[str, str, Optional[Dict[str, Any]]]]) -> List["Response"]:
         """POST to every server concurrently; raise the first failure after all
-        return (or when the active timeout budget expires).
+        return (or when the active absolute deadline expires).
 
-        Every future is drained before raising (within the timeout budget when
-        set), so a failure on one server never leaves POSTs in flight against
-        the others."""
-        timeout_s = self._effective_timeout_s()
-        deadline_at = None if timeout_s is None else (time.monotonic() + timeout_s)
+        Any previously timed-out requests must settle before new requests are
+        submitted so stale lifecycle RPCs cannot overlap a subsequent round.
+        """
+        with _CONTROL_PLANE_LOCK:
+            _ACTIVE_CLIENTS.add(self)
+
+        deadline_at = self._effective_deadline()
+        still_running = self.drain_inflight(deadline_at=deadline_at)
+        if still_running:
+            raise TimeoutError(
+                f"Cannot issue weight-sync POSTs while prior timed-out request(s) are still in flight: "
+                f"{', '.join(still_running)}"
+            )
+
+        if deadline_at is not None:
+            remaining_before_submit = deadline_at - time.monotonic()
+            if remaining_before_submit <= 0.0:
+                first_url, first_ep, _ = calls[0]
+                raise TimeoutError(f"POST {first_url}{first_ep} skipped: weight-sync phase deadline already expired")
+            req_timeout: Optional[float] = max(0.05, remaining_before_submit)
+        else:
+            req_timeout = None
+
         futures = [
-            (url, endpoint, self._pool.submit(self._post, url, endpoint, body, timeout_s))
+            (url, endpoint, self._pool.submit(self._post, url, endpoint, body, req_timeout))
             for url, endpoint, body in calls
         ]
         responses = []
         first_exc: Optional[BaseException] = None
+        timed_out: List[Tuple[str, str, Future]] = []
         for url, endpoint, fut in futures:
             try:
                 remaining = None if deadline_at is None else max(0.0, deadline_at - time.monotonic())
                 responses.append(fut.result(timeout=remaining))
             except FuturesTimeoutError:
                 fut.cancel()
-                first_exc = first_exc or TimeoutError(f"POST {url}{endpoint} did not complete within {timeout_s:g}s")
+                if not fut.done():
+                    timed_out.append((url, endpoint, fut))
+                first_exc = first_exc or TimeoutError(f"POST {url}{endpoint} exceeded weight-sync phase deadline")
             except Exception as exc:  # noqa: BLE001
                 first_exc = first_exc or exc
+        if timed_out:
+            with _CONTROL_PLANE_LOCK:
+                self._inflight_entries().extend(timed_out)
         if first_exc is not None:
             raise first_exc
         return responses
@@ -247,7 +355,7 @@ class SkyrlWeightSyncClient:
         body: Optional[Dict[str, Any]],
         timeout_s: Optional[float] = None,
     ) -> "Response":
-        # No retry; timeout defaults to None unless bounded by caller context (see module docstring).
+        # No retry; timeout defaults to None unless bounded by caller deadline (see module docstring).
         resp = self._session.post(f"{url}{endpoint}", json=body, timeout=timeout_s)
         if resp.status_code >= 400:
             raise RuntimeError(_error_message(url, endpoint, resp))

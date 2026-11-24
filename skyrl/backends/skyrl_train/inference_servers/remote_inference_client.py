@@ -1618,6 +1618,20 @@ class RemoteInferenceClient(InferenceEngineInterface):
     def _dirty_lora_servers(self) -> set[str]:
         return {url for url, rounds in self._dirty_lora_rounds().items() if rounds}
 
+    def mark_lora_servers_dirty(
+        self,
+        server_urls: Optional[List[str]] = None,
+        *,
+        round_id: Optional[str] = None,
+    ) -> None:
+        """Mark servers as requiring a preflight disarm before the next LoRA arm."""
+        urls = list(self.server_urls if server_urls is None else server_urls)
+        effective_round = round_id if round_id is not None else getattr(self, "_last_lora_round_id", None)
+        round_key = effective_round if effective_round is not None else ""
+        dirty = self._dirty_lora_rounds()
+        for url in urls:
+            dirty.setdefault(url, set()).add(round_key)
+
     def _resolve_lora_phase_budget(self, timeout_s: Optional[float]) -> Optional[float]:
         """Return a total phase budget strictly below the worker PG timeout."""
         budget = timeout_s if timeout_s is not None else _CONTROL_PLANE_PHASE_TIMEOUT_S.get()

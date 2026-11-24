@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import socket
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from ctypes import CDLL, POINTER, Structure, c_char_p, c_int, c_ulong, c_void_p
@@ -682,14 +683,20 @@ class Worker(DistributedTorchRayActor):
             return None
         return inference_engine_client.reset_prefix_cache(reset_running_requests=True)
 
-    async def _await_prefix_cache_reset(self, cache_reset_task) -> None:
+    async def _await_prefix_cache_reset(self, cache_reset_task, *, deadline_at: Optional[float] = None) -> None:
         """Await ``cache_reset_task`` within a budget strictly below the worker PG timeout."""
         from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
             control_plane_timeout_budget,
             rank0_phase_timeout_s,
         )
 
-        budget = rank0_phase_timeout_s()
+        if deadline_at is not None:
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0.0:
+                raise asyncio.TimeoutError("Prefix cache reset skipped: weight-sync phase deadline already expired")
+            budget = remaining
+        else:
+            budget = rank0_phase_timeout_s()
         with control_plane_timeout_budget(budget if budget > 0 else None):
             if budget > 0:
                 await asyncio.wait_for(cache_reset_task, timeout=budget)
@@ -716,7 +723,7 @@ class Worker(DistributedTorchRayActor):
             rank0_phase_timeout_s,
         )
         from skyrl.backends.skyrl_train.weight_sync.control_plane import (
-            weight_sync_client_timeout,
+            weight_sync_client_deadline,
         )
         from skyrl.backends.skyrl_train.weight_sync.weight_senders import (
             maybe_set_reset_prefix_cache,
@@ -737,9 +744,11 @@ class Worker(DistributedTorchRayActor):
             # engines (sharded_rdt) share GPU memory on every run and ask for the
             # toggle unconditionally.
             sync_error: Optional[BaseException] = None
+            phase_budget = rank0_phase_timeout_s()
+            phase_deadline = time.monotonic() + phase_budget if phase_budget > 0 else None
             with (
                 self._expandable_segments_disabled_for_sync(force=engine.skyrl_force_disable_expandable_segments),
-                weight_sync_client_timeout(rank0_phase_timeout_s()),
+                weight_sync_client_deadline(phase_deadline),
             ):
                 try:
                     await self._await_weight_sync_thread(engine.send_weights)
@@ -748,7 +757,7 @@ class Worker(DistributedTorchRayActor):
 
             if sync_error is None and cache_reset_task is not None:
                 try:
-                    await self._await_prefix_cache_reset(cache_reset_task)
+                    await self._await_prefix_cache_reset(cache_reset_task, deadline_at=phase_deadline)
                 except (Exception, asyncio.CancelledError) as exc:
                     sync_error = exc
                 finally:

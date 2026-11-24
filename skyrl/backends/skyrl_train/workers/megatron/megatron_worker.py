@@ -2055,7 +2055,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             rank0_phase_timeout_s,
         )
         from skyrl.backends.skyrl_train.weight_sync.control_plane import (
-            weight_sync_client_timeout,
+            drain_inflight_weight_sync_requests,
+            weight_sync_client_deadline,
         )
 
         if not isinstance(inference_engine_client, RemoteInferenceClient):
@@ -2085,13 +2086,23 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             arm_error: Optional[BaseException] = None
             if rank == 0:
                 try:
+                    arm_deadline = time.monotonic() + phase_budget if phase_budget > 0 else None
+                    still_running = await asyncio.to_thread(drain_inflight_weight_sync_requests, arm_deadline)
+                    if still_running:
+                        raise TimeoutError(
+                            f"Cannot arm LoRA receive target {lora_name!r}: prior weight-sync request(s) "
+                            f"still in flight: {', '.join(still_running)}"
+                        )
                     receive_target = source.receive_target
                     # Read while the export is still prepared: the send consumes the
                     # stream and drops it, and re-reading afterwards would be a
                     # collective this rank would run alone.
                     unique = len(source.metadata)
                     aliased = len(receive_target["aliases"])
-                    with control_plane_timeout_budget(phase_budget):
+                    remaining_arm = (
+                        max(0.05, arm_deadline - time.monotonic()) if arm_deadline is not None else phase_budget
+                    )
+                    with control_plane_timeout_budget(remaining_arm):
                         await inference_engine_client.set_lora_receive_target(receive_target)
                 except (Exception, asyncio.CancelledError) as exc:
                     arm_error = exc
@@ -2099,9 +2110,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # opens the round trip, the others only join its collectives.
             barrier_with_error_propagation(arm_error, stage="in-memory LoRA receive target setup")
 
+            send_deadline = time.monotonic() + phase_budget if phase_budget > 0 else None
             with (
                 self._expandable_segments_disabled_for_sync(force=engine.skyrl_force_disable_expandable_segments),
-                weight_sync_client_timeout(phase_budget),
+                weight_sync_client_deadline(send_deadline),
             ):
                 try:
                     await self._await_weight_sync_thread(engine.send_weights)
@@ -2113,14 +2125,33 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         # Exchange send status before loading the adapter. If send_weights failed
         # on any rank (for example in start_weight_update before finish_weight_update
-        # disarmed receivers), rank 0 must clear the armed receive targets in lockstep
-        # so the next tenant's set_lora_receive_target is not rejected as double-armed.
+        # disarmed receivers), rank 0 must drain any timed-out blocking HTTP requests
+        # and clear the armed receive targets in lockstep so the next tenant's
+        # set_lora_receive_target is not rejected as double-armed.
         any_send_failed, peer_send_err = exchange_rank_errors(send_error)
         if any_send_failed:
             cleanup_error: Optional[BaseException] = None
             if rank == 0:
                 try:
-                    failed_clears = await inference_engine_client.clear_lora_receive_target(timeout_s=phase_budget)
+                    cleanup_deadline = time.monotonic() + phase_budget if phase_budget > 0 else None
+                    drain_deadline = time.monotonic() + max(0.05, phase_budget * 0.5) if phase_budget > 0 else None
+                    still_running = await asyncio.to_thread(drain_inflight_weight_sync_requests, drain_deadline)
+                    if still_running:
+                        inference_engine_client.mark_lora_servers_dirty()
+                        if send_error is not None:
+                            send_error.add_note(
+                                f"Prior blocking weight-sync request(s) still in flight after send failure: "
+                                f"{', '.join(still_running)}"
+                            )
+                    clear_budget = (
+                        max(0.05, cleanup_deadline - time.monotonic()) if cleanup_deadline is not None else phase_budget
+                    )
+                    failed_clears = await inference_engine_client.clear_lora_receive_target(timeout_s=clear_budget)
+                    if still_running:
+                        # Re-mark dirty even if clear returned 200: a still-running
+                        # blocking lifecycle request could finish after clear and must
+                        # settle + preflight-clear before reuse.
+                        inference_engine_client.mark_lora_servers_dirty()
                     if failed_clears and send_error is not None:
                         details = ", ".join(f"{url}: {type(exc).__name__}: {exc}" for url, exc in failed_clears.items())
                         send_error.add_note(

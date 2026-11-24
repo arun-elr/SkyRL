@@ -1440,3 +1440,200 @@ def _worker_megatron_export_copy_failure_drains_collectives(
 @pytest.mark.megatron
 def test_megatron_disk_export_copy_failure_drains_remaining_collectives(tmp_path):
     _run_mp(_worker_megatron_export_copy_failure_drains_collectives, 2, tmp_path, str(tmp_path / "lora_sync"))
+
+
+def test_blocking_client_deadline_propagates_to_nested_executor():
+    """Nested ThreadPoolExecutor submissions (like NCCL sender update_weights) must inherit the deadline."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+        START_UPDATE_ENDPOINT,
+        SkyrlWeightSyncClient,
+        weight_sync_client_deadline,
+    )
+
+    release = threading.Event()
+    seen_timeouts = []
+
+    class _Resp:
+        status_code = 200
+        reason = "OK"
+        text = "{}"
+
+    class _HangingSession:
+        def post(self, url, json=None, timeout=None):
+            seen_timeouts.append(timeout)
+            release.wait(timeout=5.0)
+            return _Resp()
+
+    client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    client._urls = ["http://server-0:8000"]
+    client._dp = 1
+    client._init_payload_fn = None
+    client._timeout_s = None
+    client._start_endpoint = START_UPDATE_ENDPOINT
+    client._session = _HangingSession()
+    client._pool = ThreadPoolExecutor(max_workers=1)
+
+    nested_pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        started = time.monotonic()
+        with weight_sync_client_deadline(started + 0.25):
+            # Submit from an independent thread pool that does NOT copy ContextVars.
+            fut = nested_pool.submit(client.update_weights, {"names": ["w"]})
+            with pytest.raises(TimeoutError, match="exceeded weight-sync phase deadline"):
+                fut.result(timeout=2.0)
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0
+        assert seen_timeouts and seen_timeouts[0] is not None and seen_timeouts[0] <= 0.3
+    finally:
+        release.set()
+        client.drain_inflight(deadline_at=time.monotonic() + 2.0)
+        nested_pool.shutdown(wait=True)
+        client._pool.shutdown(wait=True)
+
+
+def _worker_shared_deadline_bounds_combined_sequential_rpcs(rank: int, world_size: int, store_path: str) -> None:
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+        rank0_phase_timeout_s,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+        START_UPDATE_ENDPOINT,
+        SkyrlWeightSyncClient,
+        weight_sync_client_deadline,
+    )
+    from skyrl.backends.skyrl_train.workers.worker_utils import exchange_rank_errors
+
+    pg_timeout_s = 2.5
+    phase_budget = rank0_phase_timeout_s(pg_timeout_s)  # 1.5s
+    _init_gloo_group(rank, world_size, store_path, timeout_s=pg_timeout_s)
+    try:
+        slow = {"flag": True}
+
+        class _Resp:
+            status_code = 200
+            reason = "OK"
+            text = "{}"
+
+        class _SlowSequentialSession:
+            def post(self, url, json=None, timeout=None):
+                if slow["flag"]:
+                    # Each RPC takes 1.0s (< 1.5s budget alone), so start + finish = 2.0s > 1.5s.
+                    # Respect socket timeout when shorter so the thread settles cleanly.
+                    sleep_s = 1.0 if timeout is None else min(1.0, timeout)
+                    time.sleep(sleep_s)
+                    if timeout is not None and timeout < 1.0:
+                        raise TimeoutError("socket timed out")
+                return _Resp()
+
+        client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+        client._urls = ["http://server-0:8000"]
+        client._dp = 1
+        client._init_payload_fn = None
+        client._timeout_s = None
+        client._start_endpoint = START_UPDATE_ENDPOINT
+        client._session = _SlowSequentialSession()
+        client._pool = ThreadPoolExecutor(max_workers=1)
+
+        try:
+            started = time.monotonic()
+            send_error = None
+            if rank == 0:
+                with weight_sync_client_deadline(started + phase_budget):
+                    try:
+                        client.start_weight_update()
+                        client.finish_weight_update()
+                    except Exception as exc:
+                        send_error = exc
+            any_failed, peer_err = exchange_rank_errors(send_error)
+            elapsed = time.monotonic() - started
+            assert elapsed < pg_timeout_s
+            assert any_failed is True
+            if rank == 0:
+                assert isinstance(send_error, TimeoutError)
+            else:
+                assert peer_err is not None and peer_err[0] == 0
+
+            # Drain any finishing thread, recover, and verify the same Gloo PG succeeds on round 2.
+            if rank == 0:
+                client.drain_inflight(deadline_at=time.monotonic() + 2.0)
+            slow["flag"] = False
+            if rank == 0:
+                with weight_sync_client_deadline(time.monotonic() + phase_budget):
+                    client.start_weight_update()
+                    client.finish_weight_update()
+            barrier_with_error_propagation(None, stage="shared deadline recovery")
+        finally:
+            client._pool.shutdown(wait=True)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_shared_deadline_bounds_combined_sequential_rpcs_on_gloo(tmp_path):
+    _run_mp(_worker_shared_deadline_bounds_combined_sequential_rpcs, 2, tmp_path)
+
+
+def test_timed_out_blocking_rpc_blocks_reuse_until_settled():
+    """A blocking POST that ignores socket timeout stays tracked and blocks reuse until it exits."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+        START_UPDATE_ENDPOINT,
+        SkyrlWeightSyncClient,
+        weight_sync_client_deadline,
+    )
+
+    release_old_post = threading.Event()
+    post_count = {"n": 0}
+
+    class _Resp:
+        status_code = 200
+        reason = "OK"
+        text = "{}"
+
+    class _StickyBlockingSession:
+        def post(self, url, json=None, timeout=None):
+            post_count["n"] += 1
+            if post_count["n"] == 1:
+                # Ignores timeout (simulates a blocking request outliving client timeout).
+                release_old_post.wait(timeout=5.0)
+            return _Resp()
+
+    client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    client._urls = ["http://server-0:8000"]
+    client._dp = 1
+    client._init_payload_fn = None
+    client._timeout_s = None
+    client._start_endpoint = START_UPDATE_ENDPOINT
+    client._session = _StickyBlockingSession()
+    client._pool = ThreadPoolExecutor(max_workers=1)
+
+    try:
+        # Round 1 times out while the blocking POST thread is still running.
+        with weight_sync_client_deadline(time.monotonic() + 0.15):
+            with pytest.raises(TimeoutError, match="exceeded weight-sync phase deadline"):
+                client.finish_weight_update()
+        assert post_count["n"] == 1
+
+        # Round 2 while Round 1's thread is still running MUST fail without issuing a second POST.
+        with weight_sync_client_deadline(time.monotonic() + 0.15):
+            with pytest.raises(TimeoutError, match="prior timed-out request\\(s\\) are still in flight"):
+                client.start_weight_update()
+        assert post_count["n"] == 1
+
+        # Release the stuck POST thread -> Round 3 drains it cleanly and succeeds.
+        release_old_post.set()
+        with weight_sync_client_deadline(time.monotonic() + 2.0):
+            client.start_weight_update()
+        assert post_count["n"] == 2
+    finally:
+        release_old_post.set()
+        client.drain_inflight(deadline_at=time.monotonic() + 2.0)
+        client._pool.shutdown(wait=True)
