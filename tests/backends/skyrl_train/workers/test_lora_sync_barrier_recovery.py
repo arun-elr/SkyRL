@@ -1656,30 +1656,110 @@ def test_timed_out_blocking_rpc_blocks_reuse_until_settled():
 
 
 def test_read_timeout_on_lifecycle_rpc_blocks_subsequent_round_without_server_confirmation():
-    """A client-side read timeout on a lifecycle RPC leaves server state unconfirmed and must block reuse."""
+    """Ambiguous read-timeout or post-connect transport errors on lifecycle RPCs must block reuse."""
     import time
     from concurrent.futures import ThreadPoolExecutor
 
     from skyrl.backends.skyrl_train.weight_sync.control_plane import (
         START_UPDATE_ENDPOINT,
         SkyrlWeightSyncClient,
-        _is_unconfirmed_timeout,
+        _is_unconfirmed_lifecycle_error,
         drain_inflight_weight_sync_requests,
         weight_sync_client_deadline,
     )
 
     calls = []
+    mode = {"exc": TimeoutError("client read timed out while server may still execute finish")}
 
     class _Resp:
         status_code = 200
         reason = "OK"
         text = "{}"
 
-    class _ReadTimeoutSession:
+    class _TransportFailureSession:
         def post(self, url, json=None, timeout=None):
             calls.append(url)
             if url.endswith("/finish_weight_update"):
-                raise TimeoutError("client read timed out while server may still execute finish")
+                raise mode["exc"]
+            return _Resp()
+
+        def close(self):
+            pass
+
+    for exc_to_raise, match_str in [
+        (TimeoutError("client read timed out while server may still execute finish"), "read timed out"),
+        (ConnectionResetError("connection reset after server accepted finish"), "connection reset"),
+    ]:
+        mode["exc"] = exc_to_raise
+        client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+        client._urls = ["http://server-0:8000"]
+        client._dp = 1
+        client._init_payload_fn = None
+        client._timeout_s = None
+        client._start_endpoint = START_UPDATE_ENDPOINT
+        client._session = _TransportFailureSession()
+        client._pool = ThreadPoolExecutor(max_workers=1)
+
+        try:
+            with weight_sync_client_deadline(time.monotonic() + 1.0):
+                with pytest.raises(type(exc_to_raise), match=match_str):
+                    client.finish_weight_update()
+
+            # Even though the HTTP future finished, server completion is unconfirmed.
+            unconfirmed = drain_inflight_weight_sync_requests(deadline_at=time.monotonic() + 0.2)
+            assert any("finish_weight_update" in entry and "unconfirmed" in entry for entry in unconfirmed)
+
+            # A subsequent tenant's lifecycle RPC must be rejected without contacting the server.
+            calls_before = len(calls)
+            with weight_sync_client_deadline(time.monotonic() + 1.0):
+                with pytest.raises(TimeoutError, match="unconfirmed"):
+                    client.start_weight_update()
+            assert len(calls) == calls_before
+        finally:
+            client.close()
+
+    # Pre-connect failures and HTTP status RuntimeErrors are NOT unconfirmed.
+    assert _is_unconfirmed_lifecycle_error(ConnectionRefusedError("refused")) is False
+    assert _is_unconfirmed_lifecycle_error(RuntimeError("HTTP 500")) is False
+    assert _is_unconfirmed_lifecycle_error(ConnectionResetError("reset")) is True
+    try:
+        import requests
+
+        assert _is_unconfirmed_lifecycle_error(requests.exceptions.ConnectTimeout("connect")) is False
+        assert (
+            _is_unconfirmed_lifecycle_error(requests.exceptions.ConnectionError(ConnectionRefusedError("refused")))
+            is False
+        )
+        assert _is_unconfirmed_lifecycle_error(requests.exceptions.ReadTimeout("read")) is True
+        assert _is_unconfirmed_lifecycle_error(requests.exceptions.ConnectionError("RemoteDisconnected")) is True
+    except ImportError:
+        pass
+
+
+def test_inflight_drain_cancellation_keeps_unfinished_request_visible():
+    """Draining must keep unfinished lifecycle futures visible in the registry even while waiting or cancelled."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+        START_UPDATE_ENDPOINT,
+        SkyrlWeightSyncClient,
+        drain_inflight_weight_sync_requests,
+        weight_sync_client_deadline,
+    )
+
+    release_rpc = threading.Event()
+    drain_started = threading.Event()
+
+    class _Resp:
+        status_code = 200
+        reason = "OK"
+        text = "{}"
+
+    class _StuckSession:
+        def post(self, url, json=None, timeout=None):
+            release_rpc.wait(timeout=5.0)
             return _Resp()
 
         def close(self):
@@ -1691,34 +1771,49 @@ def test_read_timeout_on_lifecycle_rpc_blocks_subsequent_round_without_server_co
     client._init_payload_fn = None
     client._timeout_s = None
     client._start_endpoint = START_UPDATE_ENDPOINT
-    client._session = _ReadTimeoutSession()
+    client._session = _StuckSession()
     client._pool = ThreadPoolExecutor(max_workers=1)
 
     try:
-        with weight_sync_client_deadline(time.monotonic() + 1.0):
-            with pytest.raises(TimeoutError, match="read timed out"):
+        with weight_sync_client_deadline(time.monotonic() + 0.1):
+            with pytest.raises(TimeoutError, match="exceeded weight-sync phase deadline"):
                 client.finish_weight_update()
 
-        # Even though the HTTP future finished, server completion is unconfirmed.
-        unconfirmed = drain_inflight_weight_sync_requests(deadline_at=time.monotonic() + 0.2)
-        assert any("finish_weight_update" in entry and "unconfirmed" in entry for entry in unconfirmed)
+        cancel_event = threading.Event()
+        drain_result: list[str] = []
 
-        # A subsequent tenant's lifecycle RPC must be rejected without contacting the server.
-        calls_before = len(calls)
-        with weight_sync_client_deadline(time.monotonic() + 1.0):
-            with pytest.raises(TimeoutError, match="unconfirmed"):
-                client.start_weight_update()
-        assert len(calls) == calls_before
+        def _run_drain():
+            drain_started.set()
+            drain_result.extend(
+                drain_inflight_weight_sync_requests(deadline_at=time.monotonic() + 5.0, cancel_event=cancel_event)
+            )
 
-        # ConnectTimeout (request never reached server) is NOT treated as unconfirmed.
-        try:
-            import requests
+        t = threading.Thread(target=_run_drain)
+        t.start()
+        assert drain_started.wait(timeout=1.0)
+        time.sleep(0.08)
 
-            assert _is_unconfirmed_timeout(requests.exceptions.ConnectTimeout("connect")) is False
-            assert _is_unconfirmed_timeout(requests.exceptions.ReadTimeout("read")) is True
-        except ImportError:
-            pass
+        # While _run_drain is actively waiting, a concurrent caller must STILL see the unfinished request.
+        visible = drain_inflight_weight_sync_requests(deadline_at=time.monotonic())
+        assert visible == ["http://server-0:8000/finish_weight_update"]
+
+        # Cancelling the drain stops it quickly while keeping the unfinished request registered.
+        cancel_t0 = time.monotonic()
+        cancel_event.set()
+        t.join(timeout=1.0)
+        assert not t.is_alive()
+        assert time.monotonic() - cancel_t0 < 0.5
+        assert drain_result == ["http://server-0:8000/finish_weight_update"]
+        assert drain_inflight_weight_sync_requests(deadline_at=time.monotonic()) == [
+            "http://server-0:8000/finish_weight_update"
+        ]
+
+        # Once the stuck RPC settles, the registry clears cleanly.
+        release_rpc.set()
+        assert drain_inflight_weight_sync_requests(deadline_at=time.monotonic() + 2.0) == []
     finally:
+        release_rpc.set()
+        client.drain_inflight(deadline_at=time.monotonic() + 2.0)
         client.close()
 
 
@@ -1849,6 +1944,80 @@ def test_delta_partial_pause_failure_still_resumes_all_servers():
         assert "http://server-0:8000/resume" in seen_calls
         assert "http://server-1:8000/resume" in seen_calls
     finally:
+        client.close()
+
+
+@pytest.mark.vllm
+def test_delta_resume_unpauses_healthy_servers_and_defers_stuck_server():
+    """If one server's update_weights stays stuck past cleanup deadline, healthy servers resume immediately and the stuck server resumes once settled."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+        START_UPDATE_ENDPOINT,
+        SkyrlWeightSyncClient,
+        weight_sync_client_deadline,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.delta.trainer import (
+        DeltaTrainerWeightTransferEngine,
+    )
+
+    release_server1 = threading.Event()
+    server1_resumed = threading.Event()
+    seen_calls = []
+
+    class _Resp:
+        status_code = 200
+        reason = "OK"
+        text = "{}"
+
+        def json(self):
+            return {"status": "ok"}
+
+    class _StuckOneServerSession:
+        def post(self, url, json=None, timeout=None):
+            seen_calls.append(url)
+            if url == "http://server-1:8000/update_weights":
+                release_server1.wait(timeout=5.0)
+            if url == "http://server-1:8000/resume":
+                server1_resumed.set()
+            return _Resp()
+
+        def close(self):
+            pass
+
+    client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    client._urls = ["http://server-0:8000", "http://server-1:8000"]
+    client._dp = 1
+    client._init_payload_fn = None
+    client._timeout_s = None
+    client._start_endpoint = START_UPDATE_ENDPOINT
+    client._session = _StuckOneServerSession()
+    client._pool = ThreadPoolExecutor(max_workers=2)
+
+    engine = DeltaTrainerWeightTransferEngine.__new__(DeltaTrainerWeightTransferEngine)
+    engine.client = client
+    engine._init_info = SimpleNamespace(sync_dir="/tmp/delta")
+    engine._reset_prefix_cache = False
+    engine.skyrl_draft_source = None
+
+    try:
+        with weight_sync_client_deadline(time.monotonic() + 0.5):
+            with pytest.raises(TimeoutError, match="update_weights"):
+                engine._apply_receiver_update({"target_version": 1, "sync_dir": "/tmp/delta"})
+
+        # Healthy server-0 must have been resumed synchronously during cleanup.
+        assert "http://server-0:8000/resume" in seen_calls
+        assert not server1_resumed.is_set()
+
+        # Once server-1's stuck update_weights finishes, deferred /resume unpauses server-1 automatically.
+        release_server1.set()
+        assert server1_resumed.wait(timeout=2.0)
+        assert "http://server-1:8000/resume" in seen_calls
+    finally:
+        release_server1.set()
+        client.drain_inflight(deadline_at=time.monotonic() + 2.0)
         client.close()
 
 

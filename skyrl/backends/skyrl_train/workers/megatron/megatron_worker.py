@@ -3,6 +3,7 @@ import dataclasses
 import functools
 import os
 import shutil
+import threading
 import time
 from collections import defaultdict
 from datetime import timedelta
@@ -2071,6 +2072,22 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         unique = aliased = 0
         phase_budget = rank0_phase_timeout_s()
         send_error: Optional[BaseException] = None
+
+        async def _drain_inflight_cancellable(deadline_at: Optional[float]) -> List[str]:
+            cancel_event = threading.Event()
+            drain_task = asyncio.create_task(
+                asyncio.to_thread(drain_inflight_weight_sync_requests, deadline_at, cancel_event)
+            )
+            try:
+                return await asyncio.shield(drain_task)
+            except asyncio.CancelledError:
+                cancel_event.set()
+                try:
+                    await drain_task
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+
         try:
             prepare_error: Optional[BaseException] = None
             try:
@@ -2087,7 +2104,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             if rank == 0:
                 try:
                     arm_deadline = time.monotonic() + phase_budget if phase_budget > 0 else None
-                    still_running = await asyncio.to_thread(drain_inflight_weight_sync_requests, arm_deadline)
+                    still_running = await _drain_inflight_cancellable(arm_deadline)
                     if still_running:
                         raise TimeoutError(
                             f"Cannot arm LoRA receive target {lora_name!r}: prior weight-sync request(s) "
@@ -2139,7 +2156,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 try:
                     cleanup_deadline = time.monotonic() + phase_budget if phase_budget > 0 else None
                     drain_deadline = time.monotonic() + max(0.05, phase_budget * 0.5) if phase_budget > 0 else None
-                    still_running = await asyncio.to_thread(drain_inflight_weight_sync_requests, drain_deadline)
+                    still_running = await _drain_inflight_cancellable(drain_deadline)
                     if still_running:
                         inference_engine_client.mark_lora_servers_dirty()
                         if send_error is not None:
