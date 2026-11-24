@@ -177,9 +177,18 @@ def _build_skyrl_nccl_trainer() -> "tuple[type, type]":
                         future = None
 
             # Coordinate rank-0 setup BEFORE any rank enters _broadcast()'s
-            # source.iter_full() gather collectives.
+            # source.iter_full() gather collectives. Re-check future.done() right
+            # after the first exchange in case /update_weights rejected while the
+            # exchange was in flight.
             try:
                 _coordinate_rank_error(start_error, stage="NCCL start_weight_update")
+                update_reject_error: Optional[BaseException] = None
+                if self.is_sender and future is not None and future.done():
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        update_reject_error = exc
+                _coordinate_rank_error(update_reject_error, stage="NCCL update_weights")
             except BaseException:
                 if exe is not None:
                     exe.shutdown(wait=False)

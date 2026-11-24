@@ -132,6 +132,7 @@ _STATEFUL_ENDPOINTS = frozenset(
         UPDATE_WEIGHTS_ENDPOINT,
         FINISH_UPDATE_ENDPOINT,
         PAUSE_ENDPOINT,
+        RESUME_ENDPOINT,
     }
 )
 
@@ -445,8 +446,13 @@ class SkyrlWeightSyncClient:
                 try:
                     if getattr(self, "_closed", False):
                         return
-                    self._post(url, RESUME_ENDPOINT, None, timeout_s=30.0)
+                    # Connect-only timeout so we wait for server-confirmed /resume completion;
+                    # record ambiguous post-connect transport errors as unconfirmed so a delayed
+                    # /resume cannot overlap a subsequent pause/reload.
+                    self._post(url, RESUME_ENDPOINT, None, timeout_s=(10.0, None))
                 except Exception as exc:  # noqa: BLE001
+                    if _is_unconfirmed_lifecycle_error(exc):
+                        self._record_unconfirmed_lifecycle(url, RESUME_ENDPOINT, exc)
                     logger.warning("Deferred /resume to %s failed after stuck RPC settled: %s", url, exc)
                 finally:
                     if not deferred_fut.done():

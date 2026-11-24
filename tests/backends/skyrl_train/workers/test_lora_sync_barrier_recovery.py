@@ -1819,6 +1819,7 @@ def test_inflight_drain_cancellation_keeps_unfinished_request_visible():
 
 def test_pause_endpoint_tracks_unconfirmed_transport_errors_and_deadline_race():
     """Query-bearing /pause uses connect-only timeout and tracks ambiguous transport errors; successful deadline races stay clean."""
+    import threading
     import time
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1884,6 +1885,51 @@ def test_pause_endpoint_tracks_unconfirmed_transport_errors_and_deadline_race():
         ok_client.start_weight_update()
     finally:
         ok_client.close()
+
+    # Deferred /resume transport failure must record as unconfirmed so subsequent rounds cannot overlap it.
+    release_stuck = threading.Event()
+    deferred_attempted = threading.Event()
+    deferred_timeouts = []
+
+    class _DeferredFailSession:
+        def post(self, url, json=None, timeout=None):
+            if "/pause" in url:
+                release_stuck.wait(timeout=5.0)
+                return _Resp()
+            if url.endswith("/resume"):
+                deferred_timeouts.append(timeout)
+                deferred_attempted.set()
+                raise ConnectionResetError("deferred resume lost connection")
+            return _Resp()
+
+        def close(self):
+            pass
+
+    def_client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    def_client._urls = ["http://server-0:8000"]
+    def_client._dp = 1
+    def_client._init_payload_fn = None
+    def_client._timeout_s = None
+    def_client._start_endpoint = START_UPDATE_ENDPOINT
+    def_client._session = _DeferredFailSession()
+    def_client._pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        with weight_sync_client_deadline(time.monotonic() + 0.1):
+            with pytest.raises(TimeoutError, match="exceeded weight-sync phase deadline"):
+                def_client.pause_generation()
+        with weight_sync_client_deadline(time.monotonic() + 0.1):
+            with pytest.raises(TimeoutError, match="Deferred /resume"):
+                def_client.resume_generation()
+        release_stuck.set()
+        assert deferred_attempted.wait(timeout=2.0)
+        # Wait for deferred_fut to finish recording unconfirmed transport error.
+        time.sleep(0.05)
+        assert deferred_timeouts and isinstance(deferred_timeouts[0], tuple) and deferred_timeouts[0][1] is None
+        unconfirmed_resume = drain_inflight_weight_sync_requests(deadline_at=time.monotonic() + 0.2)
+        assert any("/resume" in entry and "unconfirmed" in entry for entry in unconfirmed_resume)
+    finally:
+        release_stuck.set()
+        def_client.close()
 
 
 @pytest.mark.vllm
@@ -1989,6 +2035,71 @@ def test_delta_reload_failure_skips_resume_and_pre_reload_failure_resumes():
         assert "/resume" in seen_pre_reload_fail
     finally:
         client2.close()
+
+    # Case 3: Persistent _reload_incomplete survives across retries after an HTTP 500 reload error
+    # until a complete reload succeeds (a subsequent pre-reload pause failure must NOT resume).
+    seen_retry = []
+    retry_mode = {"phase": "fail_update_500"}
+
+    class _RetryResp:
+        def __init__(self, status_code=200, reason="OK", body=None):
+            self.status_code = status_code
+            self.reason = reason
+            self._body = body if body is not None else {"status": "ok"}
+            self.text = str(self._body)
+
+        def json(self):
+            return self._body
+
+    class _PersistentReloadSession:
+        def post(self, url, json=None, timeout=None):
+            endpoint = "/" + url.split("://", 1)[1].split("/", 1)[1]
+            seen_retry.append(endpoint)
+            if retry_mode["phase"] == "fail_update_500" and endpoint == "/update_weights":
+                return _RetryResp(500, "Internal Server Error", {"detail": "reload boom"})
+            if retry_mode["phase"] == "fail_pause_500" and endpoint.startswith("/pause"):
+                return _RetryResp(500, "Internal Server Error", {"detail": "pause boom"})
+            return _RetryResp()
+
+        def close(self):
+            pass
+
+    client3 = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    client3._urls = ["http://server-0:8000"]
+    client3._dp = 1
+    client3._init_payload_fn = None
+    client3._timeout_s = None
+    client3._start_endpoint = START_UPDATE_ENDPOINT
+    client3._session = _PersistentReloadSession()
+    client3._pool = ThreadPoolExecutor(max_workers=1)
+
+    engine3 = DeltaTrainerWeightTransferEngine.__new__(DeltaTrainerWeightTransferEngine)
+    engine3.client = client3
+    engine3._init_info = SimpleNamespace(sync_dir="/tmp/delta")
+    engine3._reset_prefix_cache = False
+    engine3.skyrl_draft_source = None
+
+    try:
+        # Round 1: HTTP 500 during update_weights -> leaves _reload_incomplete=True, skips /resume.
+        with pytest.raises(RuntimeError, match="reload boom"):
+            engine3._apply_receiver_update({"target_version": 1, "sync_dir": "/tmp/delta"})
+        assert "/resume" not in seen_retry
+        assert engine3._reload_incomplete is True
+
+        # Round 2: Pre-reload pause failure -> MUST STILL skip /resume because Round 1 never completed.
+        retry_mode["phase"] = "fail_pause_500"
+        with pytest.raises(RuntimeError, match="pause boom"):
+            engine3._apply_receiver_update({"target_version": 2, "sync_dir": "/tmp/delta"})
+        assert "/resume" not in seen_retry
+        assert engine3._reload_incomplete is True
+
+        # Round 3: Complete reload succeeds -> clears _reload_incomplete and resumes generation.
+        retry_mode["phase"] = "ok"
+        engine3._apply_receiver_update({"target_version": 3, "sync_dir": "/tmp/delta"})
+        assert engine3._reload_incomplete is False
+        assert "/resume" in seen_retry
+    finally:
+        client3.close()
 
 
 @pytest.mark.vllm
@@ -2349,6 +2460,8 @@ def _worker_skyrl_nccl_trainer_coordinates_failures(rank: int, world_size: int, 
 
             def update_weights(self, update_info):
                 calls.append(("update", update_info["names"]))
+                if not self._in_draft and fail_stage["stage"] == "update_reject":
+                    raise RuntimeError("NCCL update_weights rejected before broadcast")
 
             def finish_weight_update(self):
                 calls.append("draft_finish" if self._in_draft else "finish")
@@ -2377,7 +2490,18 @@ def _worker_skyrl_nccl_trainer_coordinates_failures(rank: int, world_size: int, 
         assert iter_counts["main"] == 0
         assert iter_counts["draft"] == 0
 
-        # 2) Rank 0 fails main finish_weight_update -> rank 1 must abort BEFORE entering draft session.
+        # 2) Rank 0 /update_weights rejects before broadcast starts -> rank 1 aborts BEFORE entering main iter_full().
+        fail_stage["stage"] = "update_reject"
+        if rank == 0:
+            with pytest.raises(RuntimeError, match="NCCL update_weights rejected"):
+                engine.send_weights()
+        else:
+            with pytest.raises(PeerRankSyncError, match="NCCL update_weights|NCCL start_weight_update"):
+                engine.send_weights()
+        assert iter_counts["main"] == 0
+        assert iter_counts["draft"] == 0
+
+        # 3) Rank 0 fails main finish_weight_update -> rank 1 must abort BEFORE entering draft session.
         fail_stage["stage"] = "finish"
         if rank == 0:
             with pytest.raises(RuntimeError, match="NCCL finish_weight_update failed"):

@@ -75,6 +75,10 @@ class DeltaTrainerWeightTransferEngine(SkyrlTrainerCapabilities, TrainerWeightTr
     # must not also fire a concurrent reset (see workers/worker.py).
     skyrl_handles_prefix_cache_reset = True
 
+    # Persists across calls whenever a reload starts without completing so a
+    # subsequent pre-reload failure cannot resume servers with incomplete weights.
+    _reload_incomplete: bool = False
+
     def __init__(
         self,
         *,
@@ -192,14 +196,12 @@ class DeltaTrainerWeightTransferEngine(SkyrlTrainerCapabilities, TrainerWeightTr
             update_deadline = None
 
         primary_exc: Optional[BaseException] = None
-        reload_started = False
-        reload_completed = False
         try:
             with weight_sync_client_deadline(update_deadline):
                 self.client.pause_generation()
                 if self._reset_prefix_cache:
                     self.client.reset_prefix_cache(reset_running_requests=True)
-                reload_started = True
+                self._reload_incomplete = True
                 self.client.start_weight_update()
                 self.client.update_weights(update_info)
                 self.client.finish_weight_update()
@@ -210,14 +212,15 @@ class DeltaTrainerWeightTransferEngine(SkyrlTrainerCapabilities, TrainerWeightTr
                         self.client.start_weight_update()
                         self.client.update_weights(update_info)
                         self.client.finish_weight_update()
-                reload_completed = True
+                self._reload_incomplete = False
         except BaseException as exc:
             primary_exc = exc
             raise
         finally:
-            if reload_started and not reload_completed:
-                # Never resume generation after start_weight_update() may have moved
-                # model weights onto the meta device or left a partial reload.
+            if self._reload_incomplete:
+                # Never resume generation while any reload has started without
+                # completing (including across retries after an earlier failed reload):
+                # model weights may be on the meta device or partially updated.
                 msg = (
                     "Skipping delta sync resume_generation because weight reload did not complete; "
                     "leaving inference servers paused to avoid serving incomplete weights."
