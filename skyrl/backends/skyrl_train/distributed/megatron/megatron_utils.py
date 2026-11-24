@@ -20,7 +20,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import itertools
 import logging
 import math
 import os
@@ -436,46 +435,19 @@ def has_packed_hf_expert_mappings(bridge) -> bool:
     return bool(_packed_hf_expert_module_patterns(bridge))
 
 
-_REGEX_META_CHARS = frozenset(r"[](){}|+?^$\ ")
-
-
-def _pattern_has_unbounded_regex(pattern: str) -> bool:
-    """Whether ``pattern`` uses regex syntax beyond plain module names and ``*`` wildcards.
-
-    Megatron-Bridge's ``wildcard_match`` compiles ``"^" + pattern.replace("*", "(.*)") + "$"``
-    without escaping regex metacharacters, so character classes, quantifiers, alternation, or
-    unescaped ``..`` can match arbitrary layer/expert indices not present as literal digits.
-    """
-    return ".." in pattern or any(ch in _REGEX_META_CHARS for ch in pattern)
-
-
-def _instantiate_module_candidates(mod_pattern: str, index_hints: Iterable[str]) -> List[str]:
-    """Instantiate wildcard module patterns using layer/expert index hints (always including 0 and 1)."""
-    indices = sorted({"0", "1", *index_hints})
-    parts = mod_pattern.replace("**", "*").split("*")
-    num_wildcards = len(parts) - 1
-    if num_wildcards == 0:
-        return [mod_pattern]
-    if num_wildcards <= 2 and len(indices) <= 16:
-        combos = itertools.product(indices, repeat=num_wildcards)
-    else:
-        combos = ((idx,) * num_wildcards for idx in indices)
-    candidates: List[str] = []
-    for combo in combos:
-        candidate = "".join(part + val for part, val in zip(parts, combo)) + parts[-1]
-        if candidate not in candidates:
-            candidates.append(candidate)
-    return candidates
+_PLAIN_MODULE_IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 def peft_targets_routed_experts(peft_config, module_patterns: Optional[Iterable[str]] = None) -> bool:
     """Whether ``peft_config`` may match any routed-expert module under Megatron-Bridge's matcher rules.
 
-    Conservatively returns ``True`` for patterns whose regex syntax could match routed experts at
-    indices not enumerated as literals (e.g. ``*.layers.[2-9][0-9].mlp.experts.linear_fc1``).
+    Sound over-approximation without index sampling: returns ``False`` only when every target
+    entry is a plain module identifier (no dots, wildcards, or regex syntax) outside the packed
+    routed-expert leaves (e.g. attention-only ``["linear_qkv", "linear_proj", "in_proj",
+    "out_proj"]``), or when ``target_modules`` is empty and ``exclude_modules`` explicitly names
+    every packed routed-expert leaf. Any wildcard, dotted path, or regex target conservatively
+    returns ``True``.
     """
-    from megatron.bridge.peft.utils import wildcard_match
-
     canonical = getattr(peft_config, "canonical_mapping", None)
     targets = list(canonical.keys()) if canonical else getattr(peft_config, "target_modules", None)
     if isinstance(targets, str):
@@ -497,38 +469,21 @@ def peft_targets_routed_experts(peft_config, module_patterns: Optional[Iterable[
     if not patterns:
         return False
 
-    hint_sources = list(targets or ()) + list(excludes)
-    index_hints = {m for s in hint_sources if isinstance(s, str) for m in re.findall(r"\d+", s)}
-    candidates = [
-        full_name for mod_pattern in patterns for full_name in _instantiate_module_candidates(mod_pattern, index_hints)
-    ]
+    packed_leaves = {p.rsplit(".", 1)[-1] for p in patterns}
 
     if targets:
         for pattern in targets:
             if not isinstance(pattern, str):
-                continue
-            if pattern.lower() == "all-linear":
                 return True
-            if _pattern_has_unbounded_regex(pattern):
+            # Only a plain identifier outside packed_leaves is guaranteed not to match
+            # either `name == pattern` or `wildcard_match(pattern, full_name)`.
+            if not _PLAIN_MODULE_IDENT_RE.match(pattern) or pattern in packed_leaves:
                 return True
-            for full_name in candidates:
-                leaf = full_name.rsplit(".", 1)[-1]
-                if leaf == pattern or wildcard_match(pattern, full_name):
-                    return True
         return False
 
     # Empty/None target_modules: Bridge adapts every linear not matched by exclude_modules.
-    # Only treat routed experts as excluded when pure non-layer-specific exclusions cover every candidate.
-    safe_excludes = [
-        ex
-        for ex in excludes
-        if isinstance(ex, str) and not _pattern_has_unbounded_regex(ex) and not re.search(r"\d", ex)
-    ]
-    for full_name in candidates:
-        leaf = full_name.rsplit(".", 1)[-1]
-        if leaf not in safe_excludes and not any(wildcard_match(ex, full_name) for ex in safe_excludes):
-            return True
-    return False
+    exclude_idents = {ex for ex in excludes if isinstance(ex, str) and _PLAIN_MODULE_IDENT_RE.match(ex)}
+    return not packed_leaves.issubset(exclude_idents)
 
 
 def validate_shared_outer_adapter_export_supported(bridge, peft_config=None) -> None:
