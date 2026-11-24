@@ -800,7 +800,7 @@ class MegatronStrategy(DistributedStrategy):
             if expand_shared_outer and allow_serving_layout:
                 raise ValueError("expand_shared_outer and allow_serving_layout cannot both be True.")
             if getattr(peft_config, "experts_shared_outer_loras", False) is True:
-                validate_shared_outer_adapter_export_supported(bridge)
+                validate_shared_outer_adapter_export_supported(bridge, peft_config)
         elif expand_shared_outer or allow_serving_layout:
             raise ValueError(
                 "expand_shared_outer and allow_serving_layout require lora_export_format to be 'adapter' or 'both'."

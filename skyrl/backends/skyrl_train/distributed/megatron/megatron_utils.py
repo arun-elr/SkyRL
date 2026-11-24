@@ -422,8 +422,41 @@ def has_packed_hf_expert_mappings(bridge) -> bool:
     return False
 
 
-def validate_shared_outer_adapter_export_supported(bridge) -> None:
+_MEGATRON_ROUTED_EXPERT_LEAVES = frozenset({"linear_fc1", "linear_fc2"})
+
+
+def peft_targets_routed_experts(peft_config) -> bool:
+    """Whether ``peft_config`` targets Megatron routed-expert linears (``linear_fc1`` / ``linear_fc2``)."""
+    targets = getattr(peft_config, "target_modules", None)
+    if targets is None:
+        return True
+    if isinstance(targets, str):
+        targets = [targets]
+    excludes = getattr(peft_config, "exclude_modules", None) or ()
+    if isinstance(excludes, str):
+        excludes = [excludes]
+    exclude_set = set(excludes)
+    if any(ex in ("experts", "*.experts.*", "mlp.experts") or ex.endswith(".experts") for ex in exclude_set):
+        return False
+    for target in targets:
+        if not isinstance(target, str):
+            continue
+        if target.lower() == "all-linear":
+            return True
+        if ".experts." in target or target.startswith("experts."):
+            return True
+        leaf = target.rsplit(".", 1)[-1]
+        if leaf in _MEGATRON_ROUTED_EXPERT_LEAVES and target not in exclude_set and leaf not in exclude_set:
+            if "shared_experts" in target or "vision_model" in target:
+                continue
+            return True
+    return False
+
+
+def validate_shared_outer_adapter_export_supported(bridge, peft_config=None) -> None:
     """Reject shared-outer LoRA HF adapter export on bridges with packed HF expert weights."""
+    if peft_config is not None and not peft_targets_routed_experts(peft_config):
+        return
     if has_packed_hf_expert_mappings(bridge):
         raise ValueError(
             "LoRA adapter HF export (`hf_export_config.lora_export_format` in ('adapter', 'both')) "

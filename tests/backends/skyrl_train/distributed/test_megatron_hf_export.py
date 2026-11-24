@@ -577,3 +577,46 @@ def test_megatron_worker_configure_lora_allows_merged_export_on_packed_experts_w
 
     worker.configure_lora(cfg.policy.model.lora, lora_type="lora", experts_shared_outer_loras=True)
     assert worker.lora_cls.experts_shared_outer_loras is True
+
+
+@pytest.mark.parametrize(
+    "lora_kwargs",
+    [
+        pytest.param({"train_mlp": False}, id="attn_only_group"),
+        pytest.param({"target_modules": ["linear_qkv", "linear_proj"]}, id="explicit_attn_targets"),
+    ],
+)
+def test_packed_experts_allow_shared_outer_adapter_export_when_experts_not_targeted(tmp_path, monkeypatch, lora_kwargs):
+    """Attention-only adapters do not wrap routed experts, so packed-expert checkpoints stay allowed."""
+    from skyrl.train.config import SkyRLLoraConfig, SkyRLTrainConfig
+
+    monkeypatch.setattr(worker_mod, "apply_packed_per_expert_sharded_state_dict_patch", Mock())
+    monkeypatch.setattr(strategy_mod.dist, "barrier", Mock())
+    cfg = SkyRLTrainConfig().trainer
+    cfg.strategy = "megatron"
+    cfg.policy.model.lora = SkyRLLoraConfig(rank=8, alpha=8, **lora_kwargs)
+    cfg.policy.megatron_config.lora_config.experts_shared_outer_loras = True
+    cfg.policy.megatron_config.hf_export_config.lora_export_format = "adapter"
+    cfg.policy.megatron_config.hf_export_config.expand_shared_outer = True
+
+    bridge, save_adapter, _ = _make_bridge_with_registry(_packed_expert_registry())
+    worker = worker_mod.MegatronPolicyWorkerBase.__new__(worker_mod.MegatronPolicyWorkerBase)
+    worker.cfg = cfg
+    worker.megatron_config = cfg.policy.megatron_config
+    worker.bridge = bridge
+    worker.provider = SimpleNamespace(num_moe_experts=4, vision_config=None, multi_latent_attention=False)
+    worker.is_vlm = False
+    worker._rank = 0
+
+    worker.configure_lora(cfg.policy.model.lora, lora_type="lora", experts_shared_outer_loras=True)
+
+    owner = _make_strategy(is_lora=True, is_rank_0=True)
+    owner.save_hf_model(
+        bridge,
+        SimpleNamespace(actor_module=["chunk0"]),
+        str(tmp_path / "attn_only_adapter"),
+        lora_export_format="adapter",
+        peft_config=worker.lora_cls,
+        expand_shared_outer=True,
+    )
+    save_adapter.assert_called_once()
