@@ -2158,27 +2158,32 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     drain_deadline = time.monotonic() + max(0.05, phase_budget * 0.5) if phase_budget > 0 else None
                     still_running = await _drain_inflight_cancellable(drain_deadline)
                     if still_running:
+                        # Do NOT disarm servers while a prior lifecycle RPC is still
+                        # running or unconfirmed: disarming now could let a delayed
+                        # /start_weight_update fall through to a base-model reload.
+                        # Keep the target armed and mark servers dirty so preflight
+                        # disarms only after all in-flight RPCs settle.
                         inference_engine_client.mark_lora_servers_dirty()
                         if send_error is not None:
                             send_error.add_note(
-                                f"Prior blocking weight-sync request(s) still in flight after send failure: "
-                                f"{', '.join(still_running)}"
+                                f"Prior blocking weight-sync request(s) still in flight or unconfirmed after send "
+                                f"failure; deferring target clear until settlement: {', '.join(still_running)}"
                             )
-                    clear_budget = (
-                        max(0.05, cleanup_deadline - time.monotonic()) if cleanup_deadline is not None else phase_budget
-                    )
-                    failed_clears = await inference_engine_client.clear_lora_receive_target(timeout_s=clear_budget)
-                    if still_running:
-                        # Re-mark dirty even if clear returned 200: a still-running
-                        # blocking lifecycle request could finish after clear and must
-                        # settle + preflight-clear before reuse.
-                        inference_engine_client.mark_lora_servers_dirty()
-                    if failed_clears and send_error is not None:
-                        details = ", ".join(f"{url}: {type(exc).__name__}: {exc}" for url, exc in failed_clears.items())
-                        send_error.add_note(
-                            f"Rollback skyrl_clear_lora_receive_target also failed on "
-                            f"{len(failed_clears)} server(s): {details}"
+                    else:
+                        clear_budget = (
+                            max(0.05, cleanup_deadline - time.monotonic())
+                            if cleanup_deadline is not None
+                            else phase_budget
                         )
+                        failed_clears = await inference_engine_client.clear_lora_receive_target(timeout_s=clear_budget)
+                        if failed_clears and send_error is not None:
+                            details = ", ".join(
+                                f"{url}: {type(exc).__name__}: {exc}" for url, exc in failed_clears.items()
+                            )
+                            send_error.add_note(
+                                f"Rollback skyrl_clear_lora_receive_target also failed on "
+                                f"{len(failed_clears)} server(s): {details}"
+                            )
                 except (Exception, asyncio.CancelledError) as exc:
                     cleanup_error = exc
                     if send_error is not None:

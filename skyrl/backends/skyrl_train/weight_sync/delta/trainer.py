@@ -192,11 +192,14 @@ class DeltaTrainerWeightTransferEngine(SkyrlTrainerCapabilities, TrainerWeightTr
             update_deadline = None
 
         primary_exc: Optional[BaseException] = None
+        reload_started = False
+        reload_completed = False
         try:
             with weight_sync_client_deadline(update_deadline):
                 self.client.pause_generation()
                 if self._reset_prefix_cache:
                     self.client.reset_prefix_cache(reset_running_requests=True)
+                reload_started = True
                 self.client.start_weight_update()
                 self.client.update_weights(update_info)
                 self.client.finish_weight_update()
@@ -207,22 +210,34 @@ class DeltaTrainerWeightTransferEngine(SkyrlTrainerCapabilities, TrainerWeightTr
                         self.client.start_weight_update()
                         self.client.update_weights(update_info)
                         self.client.finish_weight_update()
+                reload_completed = True
         except BaseException as exc:
             primary_exc = exc
             raise
         finally:
-            resume_deadline = outer_deadline
-            if resume_deadline is not None:
-                resume_deadline = max(resume_deadline, time.monotonic() + min(0.5, resume_reserve))
-            try:
-                with weight_sync_client_deadline(resume_deadline):
-                    self.client.resume_generation()
-            except Exception as resume_exc:
+            if reload_started and not reload_completed:
+                # Never resume generation after start_weight_update() may have moved
+                # model weights onto the meta device or left a partial reload.
+                msg = (
+                    "Skipping delta sync resume_generation because weight reload did not complete; "
+                    "leaving inference servers paused to avoid serving incomplete weights."
+                )
+                logger.warning(msg)
                 if primary_exc is not None:
-                    logger.warning("Delta sync resume_generation failed during cleanup: %s", resume_exc)
-                    primary_exc.add_note(f"Cleanup resume_generation also failed: {resume_exc}")
-                else:
-                    raise
+                    primary_exc.add_note(msg)
+            else:
+                resume_deadline = outer_deadline
+                if resume_deadline is not None:
+                    resume_deadline = max(resume_deadline, time.monotonic() + min(0.5, resume_reserve))
+                try:
+                    with weight_sync_client_deadline(resume_deadline):
+                        self.client.resume_generation()
+                except Exception as resume_exc:
+                    if primary_exc is not None:
+                        logger.warning("Delta sync resume_generation failed during cleanup: %s", resume_exc)
+                        primary_exc.add_note(f"Cleanup resume_generation also failed: {resume_exc}")
+                    else:
+                        raise
 
     def shutdown(self) -> None:
         self._publisher = None

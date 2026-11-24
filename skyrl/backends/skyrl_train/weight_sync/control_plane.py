@@ -32,7 +32,6 @@ import threading
 import time
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from concurrent.futures import wait as futures_wait
 from contextlib import contextmanager
 from typing import (
@@ -126,14 +125,20 @@ RESET_PREFIX_CACHE_ENDPOINT = "/reset_prefix_cache"
 PAUSE_ENDPOINT = "/pause"
 RESUME_ENDPOINT = "/resume"
 
-_LIFECYCLE_ENDPOINTS = frozenset(
+_STATEFUL_ENDPOINTS = frozenset(
     {
         START_UPDATE_ENDPOINT,
         START_DRAFT_UPDATE_ENDPOINT,
         UPDATE_WEIGHTS_ENDPOINT,
         FINISH_UPDATE_ENDPOINT,
+        PAUSE_ENDPOINT,
     }
 )
+
+
+def _is_stateful_endpoint(endpoint: str) -> bool:
+    """Return True for endpoints whose server-side state transition must be confirmed before reuse."""
+    return endpoint.split("?", 1)[0] in _STATEFUL_ENDPOINTS
 
 
 def _has_exception_in_chain(exc: BaseException, types: Tuple[type, ...]) -> bool:
@@ -324,7 +329,8 @@ class SkyrlWeightSyncClient:
         ready_urls = [url for url in self._urls if url not in stuck_urls]
 
         for url, _ep, fut in stuck_entries:
-            self._schedule_deferred_resume(url, fut)
+            if _ep.split("?", 1)[0] != RESUME_ENDPOINT:
+                self._schedule_deferred_resume(url, fut)
 
         resume_exc: Optional[BaseException] = None
         if ready_urls:
@@ -409,16 +415,21 @@ class SkyrlWeightSyncClient:
             try:
                 fut.result()
             except Exception as exc:  # noqa: BLE001
-                if endpoint in _LIFECYCLE_ENDPOINTS and _is_unconfirmed_lifecycle_error(exc):
+                if _is_stateful_endpoint(endpoint) and _is_unconfirmed_lifecycle_error(exc):
                     self._record_unconfirmed_lifecycle(url, endpoint, exc)
         return active
 
     def _schedule_deferred_resume(self, url: str, fut: Future) -> None:
+        deferred_fut: Future = Future()
         with _CONTROL_PLANE_LOCK:
             deferred = self._deferred_resume_ids()
             if id(fut) in deferred:
                 return
             deferred.add(id(fut))
+            # Track the deferred /resume itself in _inflight_entries BEFORE `fut`
+            # completes so no subsequent round can pass drain_inflight() and start
+            # a new pause/update while this older deferred /resume is still pending.
+            self._inflight_entries().append((url, RESUME_ENDPOINT, deferred_fut))
 
         def _on_settled(_done_fut: Future) -> None:
             try:
@@ -426,15 +437,20 @@ class SkyrlWeightSyncClient:
             except Exception:  # noqa: BLE001
                 pass
             if getattr(self, "_closed", False):
+                if not deferred_fut.done():
+                    deferred_fut.set_result(None)
                 return
 
             def _send_resume() -> None:
-                if getattr(self, "_closed", False):
-                    return
                 try:
+                    if getattr(self, "_closed", False):
+                        return
                     self._post(url, RESUME_ENDPOINT, None, timeout_s=30.0)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Deferred /resume to %s failed after stuck RPC settled: %s", url, exc)
+                finally:
+                    if not deferred_fut.done():
+                        deferred_fut.set_result(None)
 
             threading.Thread(target=_send_resume, name="weight-sync-deferred-resume", daemon=True).start()
 
@@ -510,19 +526,19 @@ class SkyrlWeightSyncClient:
                     f"or unconfirmed on the server: {', '.join(still_running)}"
                 )
 
-        is_lifecycle = any(endpoint in _LIFECYCLE_ENDPOINTS for _, endpoint, _ in calls)
+        is_stateful = any(_is_stateful_endpoint(endpoint) for _, endpoint, _ in calls)
         if deadline_at is not None:
             remaining_before_submit = deadline_at - time.monotonic()
             if remaining_before_submit <= 0.0:
                 first_url, first_ep, _ = calls[0]
                 raise TimeoutError(f"POST {first_url}{first_ep} skipped: weight-sync phase deadline already expired")
-            if is_lifecycle:
+            if is_stateful:
                 # Use a connect timeout only (read_timeout=None) for stateful
-                # weight-sync lifecycle RPCs so the HTTP socket stays open until
-                # the server actually finishes executing the request. The phase
-                # deadline is enforced below via fut.result(timeout=remaining),
-                # keeping the future in _inflight_futures until server-confirmed
-                # settlement.
+                # weight-sync lifecycle/pause RPCs so the HTTP socket stays open
+                # until the server actually finishes executing the request. The
+                # phase deadline is enforced below via futures_wait(timeout=...),
+                # keeping unfinished futures in _inflight_futures until
+                # server-confirmed settlement.
                 req_timeout: Any = (max(0.05, min(10.0, remaining_before_submit)), None)
             else:
                 req_timeout = max(0.05, remaining_before_submit)
@@ -533,30 +549,32 @@ class SkyrlWeightSyncClient:
             (url, endpoint, self._pool.submit(self._post, url, endpoint, body, req_timeout))
             for url, endpoint, body in calls
         ]
+        # Wait with futures_wait rather than fut.result(timeout=...) so a wait
+        # timeout is never conflated with a future's own TimeoutError or a
+        # successful completion arriving right after the deadline.
+        if deadline_at is None:
+            futures_wait([fut for _, _, fut in futures])
+        else:
+            remaining = max(0.0, deadline_at - time.monotonic())
+            futures_wait([fut for _, _, fut in futures], timeout=remaining)
+
         responses = []
         first_exc: Optional[BaseException] = None
         timed_out: List[Tuple[str, str, Future]] = []
         for url, endpoint, fut in futures:
-            try:
-                remaining = None if deadline_at is None else max(0.0, deadline_at - time.monotonic())
-                responses.append(fut.result(timeout=remaining))
-            except FuturesTimeoutError as exc:
-                if fut.done():
-                    # The HTTP call itself exited with a TimeoutError (e.g. read timeout);
-                    # for lifecycle RPCs the server may still execute the request, so
-                    # record it as unconfirmed and refuse reuse for future rounds.
-                    if endpoint in _LIFECYCLE_ENDPOINTS and _is_unconfirmed_lifecycle_error(exc):
+            if not fut.done():
+                fut.cancel()
+            if fut.done() and not fut.cancelled():
+                try:
+                    responses.append(fut.result())
+                except Exception as exc:  # noqa: BLE001
+                    if _is_stateful_endpoint(endpoint) and _is_unconfirmed_lifecycle_error(exc):
                         self._record_unconfirmed_lifecycle(url, endpoint, exc)
                     first_exc = first_exc or exc
-                else:
-                    fut.cancel()
-                    if not fut.done():
-                        timed_out.append((url, endpoint, fut))
-                    first_exc = first_exc or TimeoutError(f"POST {url}{endpoint} exceeded weight-sync phase deadline")
-            except Exception as exc:  # noqa: BLE001
-                if endpoint in _LIFECYCLE_ENDPOINTS and _is_unconfirmed_lifecycle_error(exc):
-                    self._record_unconfirmed_lifecycle(url, endpoint, exc)
-                first_exc = first_exc or exc
+            else:
+                if not fut.done():
+                    timed_out.append((url, endpoint, fut))
+                first_exc = first_exc or TimeoutError(f"POST {url}{endpoint} exceeded weight-sync phase deadline")
         if timed_out:
             with _CONTROL_PLANE_LOCK:
                 self._inflight_entries().extend(timed_out)

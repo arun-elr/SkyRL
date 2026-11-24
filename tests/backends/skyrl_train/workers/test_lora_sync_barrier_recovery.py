@@ -1817,9 +1817,78 @@ def test_inflight_drain_cancellation_keeps_unfinished_request_visible():
         client.close()
 
 
+def test_pause_endpoint_tracks_unconfirmed_transport_errors_and_deadline_race():
+    """Query-bearing /pause uses connect-only timeout and tracks ambiguous transport errors; successful deadline races stay clean."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+        START_UPDATE_ENDPOINT,
+        SkyrlWeightSyncClient,
+        drain_inflight_weight_sync_requests,
+        weight_sync_client_deadline,
+    )
+
+    seen_timeouts = []
+    mode = {"fail_pause": True}
+
+    class _Resp:
+        status_code = 200
+        reason = "OK"
+        text = "{}"
+
+    class _PauseSession:
+        def post(self, url, json=None, timeout=None):
+            seen_timeouts.append(timeout)
+            if mode["fail_pause"] and "/pause" in url:
+                raise ConnectionResetError("connection reset after server accepted pause")
+            return _Resp()
+
+        def close(self):
+            pass
+
+    client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    client._urls = ["http://server-0:8000"]
+    client._dp = 1
+    client._init_payload_fn = None
+    client._timeout_s = None
+    client._start_endpoint = START_UPDATE_ENDPOINT
+    client._session = _PauseSession()
+    client._pool = ThreadPoolExecutor(max_workers=1)
+
+    try:
+        with weight_sync_client_deadline(time.monotonic() + 1.0):
+            with pytest.raises(ConnectionResetError, match="accepted pause"):
+                client.pause_generation()
+        assert seen_timeouts and isinstance(seen_timeouts[0], tuple) and seen_timeouts[0][1] is None
+        unconfirmed = drain_inflight_weight_sync_requests(deadline_at=time.monotonic() + 0.1)
+        assert any("/pause" in entry and "unconfirmed" in entry for entry in unconfirmed)
+    finally:
+        client.close()
+
+    # Successful RPC finishing right as the deadline expires must NOT be marked unconfirmed.
+    mode["fail_pause"] = False
+    ok_client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    ok_client._urls = ["http://server-0:8000"]
+    ok_client._dp = 1
+    ok_client._init_payload_fn = None
+    ok_client._timeout_s = None
+    ok_client._start_endpoint = START_UPDATE_ENDPOINT
+    ok_client._session = _PauseSession()
+    ok_client._pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        # Tight deadline where the POST completes cleanly right at the boundary.
+        with weight_sync_client_deadline(time.monotonic() + 0.05):
+            ok_client.finish_weight_update()
+        assert drain_inflight_weight_sync_requests(deadline_at=time.monotonic() + 0.1) == []
+        ok_client.start_weight_update()
+    finally:
+        ok_client.close()
+
+
 @pytest.mark.vllm
-def test_delta_update_timeout_still_resumes_generation_and_preserves_primary_error():
-    """An update_weights timeout inside delta sync must still run resume_generation and preserve the primary error."""
+def test_delta_reload_failure_skips_resume_and_pre_reload_failure_resumes():
+    """Delta sync must NOT resume after reload starts (weights may be incomplete), but MUST resume on pre-reload failures."""
     import time
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1832,57 +1901,94 @@ def test_delta_update_timeout_still_resumes_generation_and_preserves_primary_err
         DeltaTrainerWeightTransferEngine,
     )
 
-    seen_endpoints = []
-
     class _Resp:
         status_code = 200
         reason = "OK"
         text = "{}"
 
         def json(self):
-            return {"status": "ok"}
+            return {"status": "ok", "success": True}
 
-    class _DeltaSession:
+    # Case 1: Failure during start_weight_update / update_weights must NOT call /resume.
+    seen_reload_fail = []
+
+    class _ReloadFailSession:
         def post(self, url, json=None, timeout=None):
             endpoint = "/" + url.split("://", 1)[1].split("/", 1)[1]
-            seen_endpoints.append(endpoint)
+            seen_reload_fail.append(endpoint)
             if endpoint == "/update_weights":
-                # Simulate client read timeout exhausting the update budget.
-                sleep_s = timeout[0] if isinstance(timeout, tuple) else (timeout if timeout is not None else 0.5)
-                time.sleep(min(sleep_s, 0.5))
                 raise TimeoutError("update_weights timed out on server")
             return _Resp()
 
         def close(self):
             pass
 
-    client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
-    client._urls = ["http://server-0:8000"]
-    client._dp = 1
-    client._init_payload_fn = None
-    client._timeout_s = None
-    client._start_endpoint = START_UPDATE_ENDPOINT
-    client._session = _DeltaSession()
-    client._pool = ThreadPoolExecutor(max_workers=1)
+    client1 = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    client1._urls = ["http://server-0:8000"]
+    client1._dp = 1
+    client1._init_payload_fn = None
+    client1._timeout_s = None
+    client1._start_endpoint = START_UPDATE_ENDPOINT
+    client1._session = _ReloadFailSession()
+    client1._pool = ThreadPoolExecutor(max_workers=1)
 
-    engine = DeltaTrainerWeightTransferEngine.__new__(DeltaTrainerWeightTransferEngine)
-    engine.client = client
-    engine._init_info = SimpleNamespace(sync_dir="/tmp/delta")
-    engine._reset_prefix_cache = False
-    engine.skyrl_draft_source = None
+    engine1 = DeltaTrainerWeightTransferEngine.__new__(DeltaTrainerWeightTransferEngine)
+    engine1.client = client1
+    engine1._init_info = SimpleNamespace(sync_dir="/tmp/delta")
+    engine1._reset_prefix_cache = False
+    engine1.skyrl_draft_source = None
 
     try:
         with weight_sync_client_deadline(time.monotonic() + 0.8):
-            with pytest.raises(TimeoutError, match="update_weights"):
-                engine._apply_receiver_update({"target_version": 1, "sync_dir": "/tmp/delta"})
-        assert "/pause?mode=keep&clear_cache=false" in seen_endpoints
-        assert "/update_weights" in seen_endpoints
-        assert "/resume" in seen_endpoints
-        # Unconfirmed /update_weights timeout still blocks a new lifecycle round.
+            with pytest.raises(TimeoutError, match="update_weights") as exc_info:
+                engine1._apply_receiver_update({"target_version": 1, "sync_dir": "/tmp/delta"})
+        assert "/pause?mode=keep&clear_cache=false" in seen_reload_fail
+        assert "/update_weights" in seen_reload_fail
+        assert "/resume" not in seen_reload_fail
+        assert any("Skipping delta sync resume_generation" in note for note in getattr(exc_info.value, "__notes__", []))
         with pytest.raises(TimeoutError, match="unconfirmed"):
-            client.start_weight_update()
+            client1.start_weight_update()
     finally:
-        client.close()
+        client1.close()
+
+    # Case 2: Pre-reload failure (/reset_prefix_cache timeout exhausting update budget) MUST still /resume.
+    seen_pre_reload_fail = []
+
+    class _PreReloadFailSession:
+        def post(self, url, json=None, timeout=None):
+            endpoint = "/" + url.split("://", 1)[1].split("/", 1)[1]
+            seen_pre_reload_fail.append(endpoint)
+            if endpoint.startswith("/reset_prefix_cache"):
+                time.sleep(min(timeout, 0.5) if isinstance(timeout, (int, float)) else 0.5)
+                raise TimeoutError("reset_prefix_cache timed out")
+            return _Resp()
+
+        def close(self):
+            pass
+
+    client2 = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    client2._urls = ["http://server-0:8000"]
+    client2._dp = 1
+    client2._init_payload_fn = None
+    client2._timeout_s = None
+    client2._start_endpoint = START_UPDATE_ENDPOINT
+    client2._session = _PreReloadFailSession()
+    client2._pool = ThreadPoolExecutor(max_workers=1)
+
+    engine2 = DeltaTrainerWeightTransferEngine.__new__(DeltaTrainerWeightTransferEngine)
+    engine2.client = client2
+    engine2._init_info = SimpleNamespace(sync_dir="/tmp/delta")
+    engine2._reset_prefix_cache = True
+    engine2.skyrl_draft_source = None
+
+    try:
+        with weight_sync_client_deadline(time.monotonic() + 0.8):
+            with pytest.raises(TimeoutError, match="reset_prefix_cache"):
+                engine2._apply_receiver_update({"target_version": 1, "sync_dir": "/tmp/delta"})
+        assert "/pause?mode=keep&clear_cache=false" in seen_pre_reload_fail
+        assert "/resume" in seen_pre_reload_fail
+    finally:
+        client2.close()
 
 
 @pytest.mark.vllm
@@ -1948,8 +2054,8 @@ def test_delta_partial_pause_failure_still_resumes_all_servers():
 
 
 @pytest.mark.vllm
-def test_delta_resume_unpauses_healthy_servers_and_defers_stuck_server():
-    """If one server's update_weights stays stuck past cleanup deadline, healthy servers resume immediately and the stuck server resumes once settled."""
+def test_delta_resume_unpauses_healthy_servers_and_tracks_deferred_resume():
+    """If one server's /pause stays stuck past cleanup deadline, healthy servers resume immediately and deferred /resume blocks new rounds until finished."""
     import threading
     import time
     from concurrent.futures import ThreadPoolExecutor
@@ -1957,14 +2063,16 @@ def test_delta_resume_unpauses_healthy_servers_and_defers_stuck_server():
     from skyrl.backends.skyrl_train.weight_sync.control_plane import (
         START_UPDATE_ENDPOINT,
         SkyrlWeightSyncClient,
+        drain_inflight_weight_sync_requests,
         weight_sync_client_deadline,
     )
     from skyrl.backends.skyrl_train.weight_sync.delta.trainer import (
         DeltaTrainerWeightTransferEngine,
     )
 
-    release_server1 = threading.Event()
-    server1_resumed = threading.Event()
+    release_server1_pause = threading.Event()
+    server1_resume_entered = threading.Event()
+    release_server1_resume = threading.Event()
     seen_calls = []
 
     class _Resp:
@@ -1975,13 +2083,14 @@ def test_delta_resume_unpauses_healthy_servers_and_defers_stuck_server():
         def json(self):
             return {"status": "ok"}
 
-    class _StuckOneServerSession:
+    class _StuckOneServerPauseSession:
         def post(self, url, json=None, timeout=None):
             seen_calls.append(url)
-            if url == "http://server-1:8000/update_weights":
-                release_server1.wait(timeout=5.0)
+            if url.startswith("http://server-1:8000/pause"):
+                release_server1_pause.wait(timeout=5.0)
             if url == "http://server-1:8000/resume":
-                server1_resumed.set()
+                server1_resume_entered.set()
+                release_server1_resume.wait(timeout=5.0)
             return _Resp()
 
         def close(self):
@@ -1993,7 +2102,7 @@ def test_delta_resume_unpauses_healthy_servers_and_defers_stuck_server():
     client._init_payload_fn = None
     client._timeout_s = None
     client._start_endpoint = START_UPDATE_ENDPOINT
-    client._session = _StuckOneServerSession()
+    client._session = _StuckOneServerPauseSession()
     client._pool = ThreadPoolExecutor(max_workers=2)
 
     engine = DeltaTrainerWeightTransferEngine.__new__(DeltaTrainerWeightTransferEngine)
@@ -2004,19 +2113,27 @@ def test_delta_resume_unpauses_healthy_servers_and_defers_stuck_server():
 
     try:
         with weight_sync_client_deadline(time.monotonic() + 0.5):
-            with pytest.raises(TimeoutError, match="update_weights"):
+            with pytest.raises(TimeoutError, match="pause"):
                 engine._apply_receiver_update({"target_version": 1, "sync_dir": "/tmp/delta"})
 
         # Healthy server-0 must have been resumed synchronously during cleanup.
         assert "http://server-0:8000/resume" in seen_calls
-        assert not server1_resumed.is_set()
+        assert not server1_resume_entered.is_set()
 
-        # Once server-1's stuck update_weights finishes, deferred /resume unpauses server-1 automatically.
-        release_server1.set()
-        assert server1_resumed.wait(timeout=2.0)
+        # Unblock server-1's /pause; deferred /resume starts, and while it is in flight,
+        # a new round must STILL be blocked from overlapping it.
+        release_server1_pause.set()
+        assert server1_resume_entered.wait(timeout=2.0)
+        still = drain_inflight_weight_sync_requests(deadline_at=time.monotonic())
+        assert any("/resume" in entry for entry in still)
+
+        # Once deferred /resume finishes, the registry clears cleanly.
+        release_server1_resume.set()
+        assert drain_inflight_weight_sync_requests(deadline_at=time.monotonic() + 2.0) == []
         assert "http://server-1:8000/resume" in seen_calls
     finally:
-        release_server1.set()
+        release_server1_pause.set()
+        release_server1_resume.set()
         client.drain_inflight(deadline_at=time.monotonic() + 2.0)
         client.close()
 
@@ -2292,3 +2409,134 @@ def _worker_skyrl_nccl_trainer_coordinates_failures(rank: int, world_size: int, 
 @pytest.mark.vllm
 def test_skyrl_nccl_trainer_coordinates_start_and_finish_failures_on_gloo(tmp_path):
     _run_mp(_worker_skyrl_nccl_trainer_coordinates_failures, 2, tmp_path)
+
+
+@pytest.mark.megatron
+@pytest.mark.asyncio
+async def test_megatron_in_memory_send_failure_with_inflight_rpc_defers_clear(tmp_path, monkeypatch):
+    """When send_weights fails with an in-flight /start_weight_update, cleanup must NOT disarm receivers early."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from skyrl.backends.skyrl_train.inference_servers import (
+        remote_inference_client as remote_inference_client_mod,
+    )
+    from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+        RemoteInferenceClient,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+        START_UPDATE_ENDPOINT,
+        SkyrlWeightSyncClient,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.sources import LoraAdapterWeightSource
+    from skyrl.backends.skyrl_train.weight_sync.weight_receivers import (
+        SkyrlLoraStagingMixin,
+    )
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "barrier", lambda: None)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(remote_inference_client_mod, "rank0_phase_timeout_s", lambda *a, **kw: 0.3)
+
+    class _RealStagingReceiver(SkyrlLoraStagingMixin):
+        def __init__(self):
+            self.vllm_config = SimpleNamespace(lora_config=object())
+
+    receiver = _RealStagingReceiver()
+    release_start = threading.Event()
+    delayed_start_saw_armed = []
+
+    class _Resp:
+        status_code = 200
+        reason = "OK"
+        text = "{}"
+
+    class _DelayedStartSession:
+        def post(self, url, json=None, timeout=None):
+            if url.endswith("/start_weight_update") and not release_start.is_set():
+                release_start.wait(timeout=5.0)
+                # When the delayed /start_weight_update finally executes, the receiver MUST
+                # still be LoRA-armed so it cannot fall through to a base-model reload.
+                delayed_start_saw_armed.append(receiver.skyrl_lora_armed())
+            return _Resp()
+
+        def close(self):
+            pass
+
+    blocking_client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    blocking_client._urls = ["http://server-0:8000"]
+    blocking_client._dp = 1
+    blocking_client._init_payload_fn = None
+    blocking_client._timeout_s = None
+    blocking_client._start_endpoint = START_UPDATE_ENDPOINT
+    blocking_client._session = _DelayedStartSession()
+    blocking_client._pool = ThreadPoolExecutor(max_workers=1)
+
+    class _FakeLoraSource(LoraAdapterWeightSource):
+        def __init__(self):
+            super().__init__(dtype=torch.bfloat16, experts_per_shared_adapter=1)
+
+        def export_adapter_stream(self):
+            return [("base_model.model.q_proj.lora_A.weight", torch.ones(2, 4, dtype=torch.bfloat16))]
+
+    class _Engine:
+        skyrl_force_disable_expandable_segments = False
+
+        def __init__(self, source):
+            self.source = source
+
+        def send_weights(self):
+            blocking_client.start_weight_update()
+            list(self.source.iter_full())
+            receiver.skyrl_clear_lora_receive_target()
+
+    worker = _make_megatron_lora_worker(str(tmp_path / "lora_sync"), sync_mode="memory")
+    source = _FakeLoraSource()
+    worker._lora_weight_source = source
+    worker._weight_sync_engine = _Engine(source)
+    ie_cfg = SimpleNamespace(enable_prefix_caching=False)
+
+    clear_calls = []
+    client = RemoteInferenceClient.__new__(RemoteInferenceClient)
+    client.server_urls = ["http://server-0:8000"]
+
+    async def _fake_call_server(url: str, endpoint: str, json=None, method="POST", params=None):
+        method_name = json["method"]
+        if method_name == "skyrl_set_lora_receive_target":
+            receiver.skyrl_set_lora_receive_target(json["kwargs"]["receive_target"])
+            return url, {"status": 200, "body": {}}
+        if method_name == "skyrl_clear_lora_receive_target":
+            clear_calls.append(json.get("kwargs"))
+            receiver.skyrl_clear_lora_receive_target(round_id=(json.get("kwargs") or {}).get("round_id"))
+            return url, {"status": 200, "body": {}}
+        raise AssertionError(f"Unexpected method {method_name}")
+
+    client._call_server = _fake_call_server
+    client.load_lora_adapter = AsyncMock(return_value={})
+
+    try:
+        # Round 1: /start_weight_update exceeds phase budget while still running on the server.
+        with pytest.raises(TimeoutError, match="exceeded weight-sync phase deadline") as exc_info:
+            await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-a")
+
+        # Cleanup must NOT have disarmed the receiver while /start_weight_update is still in flight.
+        assert clear_calls == []
+        assert receiver.skyrl_lora_armed() is True
+        assert any("deferring target clear" in note for note in getattr(exc_info.value, "__notes__", []))
+
+        # Delayed /start_weight_update now executes on the server: it MUST still see LoRA armed.
+        release_start.set()
+        blocking_client.drain_inflight(deadline_at=time.monotonic() + 2.0)
+        assert delayed_start_saw_armed == [True]
+
+        # Round 2: preflight disarms the dirty server now that the RPC settled, and tenant-b succeeds.
+        await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-b")
+        assert len(clear_calls) == 1
+        assert receiver.skyrl_lora_armed() is False
+        client.load_lora_adapter.assert_awaited_once_with("tenant-b", in_memory=True)
+    finally:
+        release_start.set()
+        blocking_client.drain_inflight(deadline_at=time.monotonic() + 2.0)
+        blocking_client.close()
