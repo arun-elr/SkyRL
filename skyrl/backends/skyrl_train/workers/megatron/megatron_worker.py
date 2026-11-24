@@ -156,6 +156,7 @@ from skyrl.backends.skyrl_train.workers.worker_utils import (
     all_reduce_metrics,
     barrier_with_error_propagation,
     cleanup_unawaited_task,
+    exchange_rank_errors,
     get_microbatch_iterator,
     reduce_metrics,
 )
@@ -2050,6 +2051,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
             RemoteInferenceClient,
+            control_plane_timeout_budget,
+            rank0_phase_timeout_s,
         )
 
         if not isinstance(inference_engine_client, RemoteInferenceClient):
@@ -2062,6 +2065,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         rank = torch.distributed.get_rank()
         started = time.perf_counter()
         unique = aliased = 0
+        phase_budget = rank0_phase_timeout_s()
         send_error: Optional[BaseException] = None
         try:
             prepare_error: Optional[BaseException] = None
@@ -2084,7 +2088,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     # collective this rank would run alone.
                     unique = len(source.metadata)
                     aliased = len(receive_target["aliases"])
-                    await inference_engine_client.set_lora_receive_target(receive_target)
+                    with control_plane_timeout_budget(phase_budget):
+                        await inference_engine_client.set_lora_receive_target(receive_target)
                 except (Exception, asyncio.CancelledError) as exc:
                     arm_error = exc
             # No rank may enter the transfer before every worker is armed: rank 0
@@ -2100,10 +2105,42 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             source.discard_prepared()
         sent = time.perf_counter()
 
-        load_error: Optional[BaseException] = send_error
-        if load_error is None and rank == 0:
+        # Exchange send status before loading the adapter. If send_weights failed
+        # on any rank (for example in start_weight_update before finish_weight_update
+        # disarmed receivers), rank 0 must clear the armed receive targets in lockstep
+        # so the next tenant's set_lora_receive_target is not rejected as double-armed.
+        any_send_failed, peer_send_err = exchange_rank_errors(send_error)
+        if any_send_failed:
+            cleanup_error: Optional[BaseException] = None
+            if rank == 0:
+                try:
+                    failed_clears = await inference_engine_client.clear_lora_receive_target(timeout_s=phase_budget)
+                    if failed_clears and send_error is not None:
+                        details = ", ".join(f"{url}: {type(exc).__name__}: {exc}" for url, exc in failed_clears.items())
+                        send_error.add_note(
+                            f"Rollback skyrl_clear_lora_receive_target also failed on "
+                            f"{len(failed_clears)} server(s): {details}"
+                        )
+                except (Exception, asyncio.CancelledError) as exc:
+                    cleanup_error = exc
+                    if send_error is not None:
+                        send_error.add_note(
+                            f"Rollback skyrl_clear_lora_receive_target raised {type(exc).__name__}: {exc}"
+                        )
+            barrier_with_error_propagation(
+                send_error if send_error is not None else cleanup_error,
+                stage="in-memory LoRA send cleanup",
+            )
+            if peer_send_err is not None:
+                peer_rank, exc_type, exc_msg = peer_send_err
+                raise PeerRankSyncError(f"Rank {peer_rank} failed during in-memory LoRA send: {exc_type}: {exc_msg}")
+            return
+
+        load_error: Optional[BaseException] = None
+        if rank == 0:
             try:
-                await inference_engine_client.load_lora_adapter(lora_name, in_memory=True)
+                with control_plane_timeout_budget(phase_budget):
+                    await inference_engine_client.load_lora_adapter(lora_name, in_memory=True)
                 logger.info(
                     "LoRA sync (memory): adapter {!r} {} unique tensors (+{} aliased, {:.1f}x dedupe), "
                     "exported in {:.2f}s, sent in {:.2f}s, registered on vLLM in {:.2f}s",
@@ -2243,13 +2280,16 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 # Send LoRA disk loading request to inference engine.
                 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
                     RemoteInferenceClient,
+                    control_plane_timeout_budget,
+                    rank0_phase_timeout_s,
                 )
 
-                if isinstance(inference_engine_client, RemoteInferenceClient):
-                    await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
-                else:
-                    lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
-                    await inference_engine_client.update_named_weights(lora_request)
+                with control_plane_timeout_budget(rank0_phase_timeout_s()):
+                    if isinstance(inference_engine_client, RemoteInferenceClient):
+                        await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
+                    else:
+                        lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
+                        await inference_engine_client.update_named_weights(lora_request)
             except (Exception, asyncio.CancelledError) as exc:
                 load_error = exc
 
@@ -2283,7 +2323,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 cache_error: Optional[BaseException] = None
                 if cache_reset_task is not None:
                     try:
-                        await cache_reset_task
+                        await self._await_prefix_cache_reset(cache_reset_task)
                     except (Exception, asyncio.CancelledError) as exc:
                         cache_error = exc
                     finally:

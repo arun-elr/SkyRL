@@ -22,6 +22,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+    InferenceServerTimeoutError,
     RemoteInferenceClient,
 )
 from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
@@ -934,3 +935,242 @@ async def test_load_lora_adapter_settles_all_servers_before_raising(monkeypatch)
         await client.load_lora_adapter("tenant-a", "/tmp/lora/tenant-a")
 
     assert slow_settled is True
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for bounded phase timeout, send-failure disarm, and dirty-server recovery
+# ---------------------------------------------------------------------------
+
+
+def _worker_stalled_arm_and_cleanup_bounded_below_gloo_timeout(rank: int, world_size: int, store_path: str) -> None:
+    import time
+
+    from skyrl.backends.skyrl_train.inference_servers import (
+        remote_inference_client as ric_mod,
+    )
+
+    pg_timeout_s = 2.5
+    _init_gloo_group(rank, world_size, store_path, timeout_s=pg_timeout_s)
+    orig_pg_timeout = ric_mod.SKYRL_WORKER_NCCL_TIMEOUT_IN_S
+    try:
+        ric_mod.SKYRL_WORKER_NCCL_TIMEOUT_IN_S = pg_timeout_s
+
+        client = RemoteInferenceClient.__new__(RemoteInferenceClient)
+        client.server_urls = ["http://server-stalled:8000", "http://server-ok:8001"]
+        stalled = {"flag": True}
+        armed = {}
+
+        async def _fake_call_server(url: str, endpoint: str, json=None, method="POST", params=None):
+            method_name = json["method"]
+            if "server-stalled" in url and stalled["flag"]:
+                # Both arm and rollback stall far beyond the 2.5s Gloo PG timeout.
+                await asyncio.sleep(30.0)
+            if method_name == "skyrl_set_lora_receive_target":
+                if url in armed:
+                    raise RuntimeError(f"already armed for {armed[url]}")
+                armed[url] = json["kwargs"]["receive_target"]["lora_name"]
+                return url, {"status": 200, "body": {}}
+            if method_name == "skyrl_clear_lora_receive_target":
+                armed.pop(url, None)
+                return url, {"status": 200, "body": {}}
+            raise AssertionError(f"Unexpected method {method_name}")
+
+        client._call_server = _fake_call_server
+
+        async def _run():
+            started = time.monotonic()
+            arm_error = None
+            if rank == 0:
+                try:
+                    await client.set_lora_receive_target({"kind": "lora", "lora_name": "tenant-a"})
+                except Exception as exc:
+                    arm_error = exc
+            if rank == 0:
+                with pytest.raises(InferenceServerTimeoutError) as exc_info:
+                    barrier_with_error_propagation(arm_error, stage="in-memory LoRA receive target setup")
+                # Must finish strictly below the 2.5s Gloo timeout AND note the rollback timeout.
+                elapsed = time.monotonic() - started
+                assert elapsed < pg_timeout_s
+                assert any("skyrl_clear_lora_receive_target" in n for n in getattr(exc_info.value, "__notes__", []))
+                assert "http://server-stalled:8000" in client._dirty_lora_servers()
+            else:
+                with pytest.raises(PeerRankSyncError, match="Rank 0 failed"):
+                    barrier_with_error_propagation(None, stage="in-memory LoRA receive target setup")
+
+            # Server recovers; preflight disarm clears dirty state and round 2 succeeds on the SAME Gloo PG.
+            stalled["flag"] = False
+            arm_error = None
+            if rank == 0:
+                await client.set_lora_receive_target({"kind": "lora", "lora_name": "tenant-b"})
+            barrier_with_error_propagation(arm_error, stage="in-memory LoRA receive target setup")
+            if rank == 0:
+                assert armed == {
+                    "http://server-stalled:8000": "tenant-b",
+                    "http://server-ok:8001": "tenant-b",
+                }
+                assert client._dirty_lora_servers() == set()
+
+        asyncio.run(_run())
+    finally:
+        ric_mod.SKYRL_WORKER_NCCL_TIMEOUT_IN_S = orig_pg_timeout
+        dist.destroy_process_group()
+
+
+def test_stalled_arm_and_cleanup_bounded_below_gloo_timeout(tmp_path):
+    _run_mp(_worker_stalled_arm_and_cleanup_bounded_below_gloo_timeout, 2, tmp_path)
+
+
+def _worker_megatron_send_failure_disarms_real_receivers(
+    rank: int, world_size: int, store_path: str, sync_dir: str
+) -> None:
+    from skyrl.backends.skyrl_train.weight_sync.sources import LoraAdapterWeightSource
+    from skyrl.backends.skyrl_train.weight_sync.weight_receivers import (
+        SkyrlLoraStagingMixin,
+    )
+
+    _init_gloo_group(rank, world_size, store_path)
+    orig_empty_cache = torch.cuda.empty_cache
+    try:
+        torch.cuda.empty_cache = lambda: None
+
+        class _RealStagingReceiver(SkyrlLoraStagingMixin):
+            vllm_config = SimpleNamespace(lora_config=object())
+
+        receivers = {
+            "http://server-0:8000": _RealStagingReceiver(),
+            "http://server-1:8001": _RealStagingReceiver(),
+        }
+
+        class _FakeLoraSource(LoraAdapterWeightSource):
+            def __init__(self):
+                super().__init__(dtype=torch.bfloat16, experts_per_shared_adapter=1)
+
+            def export_adapter_stream(self):
+                return [("base_model.model.q_proj.lora_A.weight", torch.ones(2, 4, dtype=torch.bfloat16))]
+
+        class _FailFirstSendEngine:
+            skyrl_force_disable_expandable_segments = False
+
+            def __init__(self, source):
+                self.source = source
+                self.calls = 0
+
+            def send_weights(self):
+                self.calls += 1
+                if self.calls == 1:
+                    # Simulate rank-0 failing in start_weight_update before finish_weight_update disarms receivers.
+                    if rank == 0:
+                        assert all(r.skyrl_lora_armed() for r in receivers.values())
+                        raise RuntimeError("start_weight_update failed before finish_weight_update")
+                    return
+                list(self.source.iter_full())
+                if rank == 0:
+                    # Normal finish_weight_update disarms every receiver.
+                    for r in receivers.values():
+                        r.skyrl_clear_lora_receive_target()
+
+        worker = _make_megatron_lora_worker(sync_dir, sync_mode="memory")
+        source = _FakeLoraSource()
+        engine = _FailFirstSendEngine(source)
+        worker._lora_weight_source = source
+        worker._weight_sync_engine = engine
+        ie_cfg = SimpleNamespace(enable_prefix_caching=False)
+
+        client = RemoteInferenceClient.__new__(RemoteInferenceClient)
+        client.server_urls = list(receivers.keys())
+        loaded = []
+
+        async def _fake_call_server(url: str, endpoint: str, json=None, method="POST", params=None):
+            method_name = json["method"]
+            recv = receivers[url]
+            if method_name == "skyrl_set_lora_receive_target":
+                recv.skyrl_set_lora_receive_target(json["kwargs"]["receive_target"])
+                return url, {"status": 200, "body": {}}
+            if method_name == "skyrl_clear_lora_receive_target":
+                recv.skyrl_clear_lora_receive_target()
+                return url, {"status": 200, "body": {}}
+            raise AssertionError(f"Unexpected method {method_name}")
+
+        async def _fake_load_lora(lora_name: str, lora_path=None, *, in_memory: bool = False):
+            assert in_memory is True
+            loaded.append(lora_name)
+            return {}
+
+        client._call_server = _fake_call_server
+        client.load_lora_adapter = AsyncMock(side_effect=_fake_load_lora)
+
+        async def _run():
+            # Round 1: arm succeeds on real staging receivers, then rank-0 send_weights fails before finish.
+            if rank == 0:
+                with pytest.raises(RuntimeError, match="start_weight_update failed"):
+                    await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-a")
+                assert all(not r.skyrl_lora_armed() for r in receivers.values())
+                assert loaded == []
+            else:
+                await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-a")
+
+            # Round 2: next tenant arms the same real staging receivers without hitting "already armed".
+            await worker.broadcast_to_inference_engines(client, ie_cfg, model_id="tenant-b")
+            if rank == 0:
+                assert loaded == ["tenant-b"]
+                assert all(not r.skyrl_lora_armed() for r in receivers.values())
+
+        asyncio.run(_run())
+    finally:
+        torch.cuda.empty_cache = orig_empty_cache
+        dist.destroy_process_group()
+
+
+@pytest.mark.megatron
+def test_megatron_in_memory_send_failure_disarms_real_staging_receivers(tmp_path):
+    _run_mp(_worker_megatron_send_failure_disarms_real_receivers, 2, tmp_path, str(tmp_path / "lora_sync"))
+
+
+@pytest.mark.asyncio
+async def test_failed_disarm_reported_blocks_reuse_until_recovery():
+    """A failed disarm preserves the original error with a note and blocks reuse until cleanup succeeds."""
+    client = RemoteInferenceClient.__new__(RemoteInferenceClient)
+    client.server_urls = ["http://server-a:8000", "http://server-b:8001"]
+
+    armed = {}
+    state = {"fail_b_arm": True, "fail_a_clear": True}
+
+    async def _fake_call_server(url: str, endpoint: str, json=None, method="POST", params=None):
+        method_name = json["method"]
+        if method_name == "skyrl_set_lora_receive_target":
+            if "server-b" in url and state["fail_b_arm"]:
+                raise ConnectionRefusedError("server-b unreachable during arm")
+            if url in armed:
+                raise RuntimeError(f"already armed for {armed[url]}")
+            armed[url] = json["kwargs"]["receive_target"]["lora_name"]
+            return url, {"status": 200, "body": {}}
+        if method_name == "skyrl_clear_lora_receive_target":
+            if "server-a" in url and state["fail_a_clear"]:
+                raise ConnectionError("server-a dropped clear RPC")
+            armed.pop(url, None)
+            return url, {"status": 200, "body": {}}
+        raise AssertionError(f"Unexpected method {method_name}")
+
+    client._call_server = _fake_call_server
+
+    # Round 1: server-a arms, server-b fails arm, and rollback clear fails on server-a.
+    with pytest.raises(ConnectionRefusedError, match="server-b unreachable") as exc_info:
+        await client.set_lora_receive_target({"kind": "lora", "lora_name": "tenant-a"})
+    assert any("server-a:8000" in n for n in getattr(exc_info.value, "__notes__", []))
+    assert "http://server-a:8000" in client._dirty_lora_servers()
+    assert armed == {"http://server-a:8000": "tenant-a"}
+
+    # Round 2: server-b is healthy now, but server-a's clear still fails -> must reject BEFORE arming server-b.
+    state["fail_b_arm"] = False
+    with pytest.raises(RuntimeError, match="prior disarm still failing"):
+        await client.set_lora_receive_target({"kind": "lora", "lora_name": "tenant-b"})
+    assert "http://server-b:8001" not in armed
+
+    # Round 3: server-a recovers -> preflight disarm clears server-a, then both servers arm for tenant-b.
+    state["fail_a_clear"] = False
+    await client.set_lora_receive_target({"kind": "lora", "lora_name": "tenant-b"})
+    assert client._dirty_lora_servers() == set()
+    assert armed == {
+        "http://server-a:8000": "tenant-b",
+        "http://server-b:8001": "tenant-b",
+    }

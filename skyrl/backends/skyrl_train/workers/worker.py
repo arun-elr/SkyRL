@@ -682,6 +682,20 @@ class Worker(DistributedTorchRayActor):
             return None
         return inference_engine_client.reset_prefix_cache(reset_running_requests=True)
 
+    async def _await_prefix_cache_reset(self, cache_reset_task) -> None:
+        """Await ``cache_reset_task`` within a budget strictly below the worker PG timeout."""
+        from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+            control_plane_timeout_budget,
+            rank0_phase_timeout_s,
+        )
+
+        budget = rank0_phase_timeout_s()
+        with control_plane_timeout_budget(budget if budget > 0 else None):
+            if budget > 0:
+                await asyncio.wait_for(cache_reset_task, timeout=budget)
+            else:
+                await cache_reset_task
+
     async def _sync_weights_to_inference_engines(
         self,
         inference_engine_client,
@@ -725,7 +739,7 @@ class Worker(DistributedTorchRayActor):
 
             if sync_error is None and cache_reset_task is not None:
                 try:
-                    await cache_reset_task
+                    await self._await_prefix_cache_reset(cache_reset_task)
                 except (Exception, asyncio.CancelledError) as exc:
                     sync_error = exc
                 finally:

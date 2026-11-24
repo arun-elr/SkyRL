@@ -195,13 +195,16 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 # Send LoRA disk loading request to inference engine.
                 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
                     RemoteInferenceClient,
+                    control_plane_timeout_budget,
+                    rank0_phase_timeout_s,
                 )
 
-                if isinstance(inference_engine_client, RemoteInferenceClient):
-                    await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
-                else:
-                    lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
-                    await inference_engine_client.update_named_weights(lora_request)
+                with control_plane_timeout_budget(rank0_phase_timeout_s()):
+                    if isinstance(inference_engine_client, RemoteInferenceClient):
+                        await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
+                    else:
+                        lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
+                        await inference_engine_client.update_named_weights(lora_request)
             except (Exception, asyncio.CancelledError) as exc:
                 sync_error = exc
 
@@ -237,7 +240,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 cache_error: Optional[BaseException] = None
                 if cache_reset_task is not None:
                     try:
-                        await cache_reset_task
+                        await self._await_prefix_cache_reset(cache_reset_task)
                     except (Exception, asyncio.CancelledError) as exc:
                         cache_error = exc
                     finally:
