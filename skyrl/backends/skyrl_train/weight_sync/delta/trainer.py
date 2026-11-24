@@ -191,11 +191,10 @@ class DeltaTrainerWeightTransferEngine(SkyrlTrainerCapabilities, TrainerWeightTr
         else:
             update_deadline = None
 
-        with weight_sync_client_deadline(update_deadline):
-            self.client.pause_generation()
         primary_exc: Optional[BaseException] = None
         try:
             with weight_sync_client_deadline(update_deadline):
+                self.client.pause_generation()
                 if self._reset_prefix_cache:
                     self.client.reset_prefix_cache(reset_running_requests=True)
                 self.client.start_weight_update()

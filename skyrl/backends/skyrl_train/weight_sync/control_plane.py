@@ -122,6 +122,29 @@ RESET_PREFIX_CACHE_ENDPOINT = "/reset_prefix_cache"
 PAUSE_ENDPOINT = "/pause"
 RESUME_ENDPOINT = "/resume"
 
+_LIFECYCLE_ENDPOINTS = frozenset(
+    {
+        START_UPDATE_ENDPOINT,
+        START_DRAFT_UPDATE_ENDPOINT,
+        UPDATE_WEIGHTS_ENDPOINT,
+        FINISH_UPDATE_ENDPOINT,
+    }
+)
+
+
+def _is_unconfirmed_timeout(exc: BaseException) -> bool:
+    """Return True when ``exc`` indicates a client-side read timeout after the request may have reached the server."""
+    try:
+        import requests
+
+        if isinstance(exc, requests.exceptions.ConnectTimeout):
+            return False
+        if isinstance(exc, requests.exceptions.Timeout):
+            return True
+    except ImportError:
+        pass
+    return isinstance(exc, TimeoutError)
+
 
 class SkyrlWeightSyncClient:
     """``VLLMWeightSyncClient`` over the inference servers' native HTTP routes.
@@ -241,10 +264,12 @@ class SkyrlWeightSyncClient:
         )
 
     def resume_generation(self) -> None:
-        self._fanout_uniform(RESUME_ENDPOINT, None)
+        self._fanout([(url, RESUME_ENDPOINT, None) for url in self._urls], allow_unconfirmed=True)
 
     def close(self) -> None:
         """Release the HTTP session + fan-out pool. Idempotent."""
+        with _CONTROL_PLANE_LOCK:
+            _ACTIVE_CLIENTS.discard(self)
         self._pool.shutdown(wait=True)
         self._session.close()
 
@@ -260,6 +285,20 @@ class SkyrlWeightSyncClient:
             self._inflight_futures = inflight
         return inflight
 
+    def _unconfirmed_entries(self) -> List[str]:
+        unconfirmed = getattr(self, "_unconfirmed_lifecycle_requests", None)
+        if unconfirmed is None:
+            unconfirmed = []
+            self._unconfirmed_lifecycle_requests = unconfirmed
+        return unconfirmed
+
+    def _record_unconfirmed_lifecycle(self, url: str, endpoint: str) -> None:
+        entry = f"{url}{endpoint} (unconfirmed read timeout)"
+        with _CONTROL_PLANE_LOCK:
+            unconfirmed = self._unconfirmed_entries()
+            if entry not in unconfirmed:
+                unconfirmed.append(entry)
+
     def _effective_deadline(self) -> Optional[float]:
         proc_deadline = _current_process_deadline()
         if proc_deadline is not None:
@@ -269,10 +308,17 @@ class SkyrlWeightSyncClient:
             return time.monotonic() + inst_timeout
         return None
 
-    def drain_inflight(self, deadline_at: Optional[float] = None) -> List[str]:
+    def drain_inflight(
+        self,
+        deadline_at: Optional[float] = None,
+        *,
+        include_unconfirmed: bool = True,
+    ) -> List[str]:
         """Drain previously timed-out POST futures on this client up to ``deadline_at``.
 
-        Returns descriptions of any futures still running past ``deadline_at``.
+        Returns descriptions of any futures still running past ``deadline_at`` plus
+        (when ``include_unconfirmed`` is True) any prior lifecycle RPCs that ended
+        with an unconfirmed client-side read timeout.
         """
         with _CONTROL_PLANE_LOCK:
             pending = list(self._inflight_entries())
@@ -284,8 +330,9 @@ class SkyrlWeightSyncClient:
             if fut.done():
                 try:
                     fut.result()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    if endpoint in _LIFECYCLE_ENDPOINTS and _is_unconfirmed_timeout(exc):
+                        self._record_unconfirmed_lifecycle(url, endpoint)
             else:
                 active.append((url, endpoint, fut))
 
@@ -303,40 +350,58 @@ class SkyrlWeightSyncClient:
                     if fut in done_futs or fut.done():
                         try:
                             fut.result()
-                        except Exception:  # noqa: BLE001
-                            pass
+                        except Exception as exc:  # noqa: BLE001
+                            if endpoint in _LIFECYCLE_ENDPOINTS and _is_unconfirmed_timeout(exc):
+                                self._record_unconfirmed_lifecycle(url, endpoint)
                     else:
                         still_running.append((url, endpoint, fut))
 
-        if still_running:
-            with _CONTROL_PLANE_LOCK:
+        with _CONTROL_PLANE_LOCK:
+            if still_running:
                 self._inflight_entries().extend(still_running)
-        return [f"{url}{endpoint}" for url, endpoint, _ in still_running]
+            unconfirmed = list(self._unconfirmed_entries()) if include_unconfirmed else []
+        return [f"{url}{endpoint}" for url, endpoint, _ in still_running] + unconfirmed
 
-    def _fanout(self, calls: Sequence[Tuple[str, str, Optional[Dict[str, Any]]]]) -> List["Response"]:
+    def _fanout(
+        self,
+        calls: Sequence[Tuple[str, str, Optional[Dict[str, Any]]]],
+        *,
+        allow_unconfirmed: bool = False,
+    ) -> List["Response"]:
         """POST to every server concurrently; raise the first failure after all
         return (or when the active absolute deadline expires).
 
-        Any previously timed-out requests must settle before new requests are
-        submitted so stale lifecycle RPCs cannot overlap a subsequent round.
+        Any previously timed-out requests must settle with server confirmation
+        before new lifecycle requests are submitted so stale lifecycle RPCs
+        cannot overlap a subsequent round.
         """
         with _CONTROL_PLANE_LOCK:
             _ACTIVE_CLIENTS.add(self)
 
         deadline_at = self._effective_deadline()
-        still_running = self.drain_inflight(deadline_at=deadline_at)
+        still_running = self.drain_inflight(deadline_at=deadline_at, include_unconfirmed=not allow_unconfirmed)
         if still_running:
             raise TimeoutError(
-                f"Cannot issue weight-sync POSTs while prior timed-out request(s) are still in flight: "
-                f"{', '.join(still_running)}"
+                f"Cannot issue weight-sync POSTs while prior timed-out request(s) are still in flight "
+                f"or unconfirmed on the server: {', '.join(still_running)}"
             )
 
+        is_lifecycle = any(endpoint in _LIFECYCLE_ENDPOINTS for _, endpoint, _ in calls)
         if deadline_at is not None:
             remaining_before_submit = deadline_at - time.monotonic()
             if remaining_before_submit <= 0.0:
                 first_url, first_ep, _ = calls[0]
                 raise TimeoutError(f"POST {first_url}{first_ep} skipped: weight-sync phase deadline already expired")
-            req_timeout: Optional[float] = max(0.05, remaining_before_submit)
+            if is_lifecycle:
+                # Use a connect timeout only (read_timeout=None) for stateful
+                # weight-sync lifecycle RPCs so the HTTP socket stays open until
+                # the server actually finishes executing the request. The phase
+                # deadline is enforced below via fut.result(timeout=remaining),
+                # keeping the future in _inflight_futures until server-confirmed
+                # settlement.
+                req_timeout: Any = (max(0.05, min(10.0, remaining_before_submit)), None)
+            else:
+                req_timeout = max(0.05, remaining_before_submit)
         else:
             req_timeout = None
 
@@ -353,8 +418,11 @@ class SkyrlWeightSyncClient:
                 responses.append(fut.result(timeout=remaining))
             except FuturesTimeoutError as exc:
                 if fut.done():
-                    # The request itself finished with a TimeoutError (e.g. socket.timeout);
-                    # it is settled, so do not record it as still in flight.
+                    # The HTTP call itself exited with a TimeoutError (e.g. read timeout);
+                    # for lifecycle RPCs the server may still execute the request, so
+                    # record it as unconfirmed and refuse reuse for future rounds.
+                    if endpoint in _LIFECYCLE_ENDPOINTS and _is_unconfirmed_timeout(exc):
+                        self._record_unconfirmed_lifecycle(url, endpoint)
                     first_exc = first_exc or exc
                 else:
                     fut.cancel()
@@ -362,6 +430,8 @@ class SkyrlWeightSyncClient:
                         timed_out.append((url, endpoint, fut))
                     first_exc = first_exc or TimeoutError(f"POST {url}{endpoint} exceeded weight-sync phase deadline")
             except Exception as exc:  # noqa: BLE001
+                if endpoint in _LIFECYCLE_ENDPOINTS and _is_unconfirmed_timeout(exc):
+                    self._record_unconfirmed_lifecycle(url, endpoint)
                 first_exc = first_exc or exc
         if timed_out:
             with _CONTROL_PLANE_LOCK:
@@ -375,7 +445,7 @@ class SkyrlWeightSyncClient:
         url: str,
         endpoint: str,
         body: Optional[Dict[str, Any]],
-        timeout_s: Optional[float] = None,
+        timeout_s: Any = None,
     ) -> "Response":
         # No retry; timeout defaults to None unless bounded by caller deadline (see module docstring).
         resp = self._session.post(f"{url}{endpoint}", json=body, timeout=timeout_s)

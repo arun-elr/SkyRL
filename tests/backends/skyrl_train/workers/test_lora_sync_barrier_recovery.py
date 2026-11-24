@@ -1194,6 +1194,9 @@ def _worker_blocking_client_stalled_finish_recovers_gloo(rank: int, world_size: 
     pg_timeout_s = 2.5
     _init_gloo_group(rank, world_size, store_path, timeout_s=pg_timeout_s)
     try:
+        import threading
+
+        release_stalled = threading.Event()
         stalled = {"flag": True}
 
         class _Resp:
@@ -1207,9 +1210,8 @@ def _worker_blocking_client_stalled_finish_recovers_gloo(rank: int, world_size: 
         class _BlockingSession:
             def post(self, url, json=None, timeout=None):
                 if url.endswith("/finish_weight_update") and stalled["flag"]:
-                    # Respect socket timeout if smaller, otherwise stall far past Gloo's 2.5s timeout.
-                    time.sleep(min(timeout, 30.0) if timeout is not None else 30.0)
-                    raise TimeoutError("simulated read timeout")
+                    # Simulate a server that stalls past the phase budget, then finishes and confirms settlement.
+                    release_stalled.wait(timeout=30.0)
                 return _Resp()
 
             def close(self):
@@ -1244,15 +1246,19 @@ def _worker_blocking_client_stalled_finish_recovers_gloo(rank: int, world_size: 
             else:
                 assert peer_err is not None and peer_err[0] == 0
 
-            # Round 2: server recovers; same Gloo PG and blocking client both succeed.
+            # Round 2: stalled server RPC settles with server confirmation; same Gloo PG and client succeed.
+            release_stalled.set()
             stalled["flag"] = False
             send_error = None
             if rank == 0:
+                client.drain_inflight(deadline_at=time.monotonic() + 2.0)
                 with weight_sync_client_timeout(rank0_phase_timeout_s(pg_timeout_s)):
                     client.finish_weight_update()
             barrier_with_error_propagation(send_error, stage="blocking finish recovery")
         finally:
-            client._pool.shutdown(wait=False)
+            release_stalled.set()
+            client.drain_inflight(deadline_at=time.monotonic() + 2.0)
+            client.close()
     finally:
         dist.destroy_process_group()
 
@@ -1468,6 +1474,9 @@ def test_blocking_client_deadline_propagates_to_nested_executor():
             release.wait(timeout=5.0)
             return _Resp()
 
+        def close(self):
+            pass
+
     client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
     client._urls = ["http://server-0:8000"]
     client._dp = 1
@@ -1487,12 +1496,15 @@ def test_blocking_client_deadline_propagates_to_nested_executor():
                 fut.result(timeout=2.0)
         elapsed = time.monotonic() - started
         assert elapsed < 1.0
-        assert seen_timeouts and seen_timeouts[0] is not None and seen_timeouts[0] <= 0.3
+        assert seen_timeouts and isinstance(seen_timeouts[0], tuple)
+        connect_t, read_t = seen_timeouts[0]
+        assert connect_t is not None and connect_t <= 0.3
+        assert read_t is None
     finally:
         release.set()
         client.drain_inflight(deadline_at=time.monotonic() + 2.0)
         nested_pool.shutdown(wait=True)
-        client._pool.shutdown(wait=True)
+        client.close()
 
 
 def _worker_shared_deadline_bounds_combined_sequential_rpcs(rank: int, world_size: int, store_path: str) -> None:
@@ -1524,12 +1536,13 @@ def _worker_shared_deadline_bounds_combined_sequential_rpcs(rank: int, world_siz
             def post(self, url, json=None, timeout=None):
                 if slow["flag"]:
                     # Each RPC takes 1.0s (< 1.5s budget alone), so start + finish = 2.0s > 1.5s.
-                    # Respect socket timeout when shorter so the thread settles cleanly.
-                    sleep_s = 1.0 if timeout is None else min(1.0, timeout)
-                    time.sleep(sleep_s)
-                    if timeout is not None and timeout < 1.0:
-                        raise TimeoutError("socket timed out")
+                    # Lifecycle RPCs use (connect_timeout, None) so the socket stays open until
+                    # the server finishes executing and confirms settlement.
+                    time.sleep(1.0)
                 return _Resp()
+
+            def close(self):
+                pass
 
         client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
         client._urls = ["http://server-0:8000"]
@@ -1569,7 +1582,7 @@ def _worker_shared_deadline_bounds_combined_sequential_rpcs(rank: int, world_siz
                     client.finish_weight_update()
             barrier_with_error_propagation(None, stage="shared deadline recovery")
         finally:
-            client._pool.shutdown(wait=True)
+            client.close()
     finally:
         dist.destroy_process_group()
 
@@ -1606,6 +1619,9 @@ def test_timed_out_blocking_rpc_blocks_reuse_until_settled():
                 release_old_post.wait(timeout=5.0)
             return _Resp()
 
+        def close(self):
+            pass
+
     client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
     client._urls = ["http://server-0:8000"]
     client._dp = 1
@@ -1636,7 +1652,74 @@ def test_timed_out_blocking_rpc_blocks_reuse_until_settled():
     finally:
         release_old_post.set()
         client.drain_inflight(deadline_at=time.monotonic() + 2.0)
-        client._pool.shutdown(wait=True)
+        client.close()
+
+
+def test_read_timeout_on_lifecycle_rpc_blocks_subsequent_round_without_server_confirmation():
+    """A client-side read timeout on a lifecycle RPC leaves server state unconfirmed and must block reuse."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+        START_UPDATE_ENDPOINT,
+        SkyrlWeightSyncClient,
+        _is_unconfirmed_timeout,
+        drain_inflight_weight_sync_requests,
+        weight_sync_client_deadline,
+    )
+
+    calls = []
+
+    class _Resp:
+        status_code = 200
+        reason = "OK"
+        text = "{}"
+
+    class _ReadTimeoutSession:
+        def post(self, url, json=None, timeout=None):
+            calls.append(url)
+            if url.endswith("/finish_weight_update"):
+                raise TimeoutError("client read timed out while server may still execute finish")
+            return _Resp()
+
+        def close(self):
+            pass
+
+    client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    client._urls = ["http://server-0:8000"]
+    client._dp = 1
+    client._init_payload_fn = None
+    client._timeout_s = None
+    client._start_endpoint = START_UPDATE_ENDPOINT
+    client._session = _ReadTimeoutSession()
+    client._pool = ThreadPoolExecutor(max_workers=1)
+
+    try:
+        with weight_sync_client_deadline(time.monotonic() + 1.0):
+            with pytest.raises(TimeoutError, match="read timed out"):
+                client.finish_weight_update()
+
+        # Even though the HTTP future finished, server completion is unconfirmed.
+        unconfirmed = drain_inflight_weight_sync_requests(deadline_at=time.monotonic() + 0.2)
+        assert any("finish_weight_update" in entry and "unconfirmed" in entry for entry in unconfirmed)
+
+        # A subsequent tenant's lifecycle RPC must be rejected without contacting the server.
+        calls_before = len(calls)
+        with weight_sync_client_deadline(time.monotonic() + 1.0):
+            with pytest.raises(TimeoutError, match="unconfirmed"):
+                client.start_weight_update()
+        assert len(calls) == calls_before
+
+        # ConnectTimeout (request never reached server) is NOT treated as unconfirmed.
+        try:
+            import requests
+
+            assert _is_unconfirmed_timeout(requests.exceptions.ConnectTimeout("connect")) is False
+            assert _is_unconfirmed_timeout(requests.exceptions.ReadTimeout("read")) is True
+        except ImportError:
+            pass
+    finally:
+        client.close()
 
 
 @pytest.mark.vllm
@@ -1669,10 +1752,14 @@ def test_delta_update_timeout_still_resumes_generation_and_preserves_primary_err
             endpoint = "/" + url.split("://", 1)[1].split("/", 1)[1]
             seen_endpoints.append(endpoint)
             if endpoint == "/update_weights":
-                # Simulate socket timeout exhausting the update budget.
-                time.sleep(min(timeout, 5.0) if timeout is not None else 0.5)
+                # Simulate client read timeout exhausting the update budget.
+                sleep_s = timeout[0] if isinstance(timeout, tuple) else (timeout if timeout is not None else 0.5)
+                time.sleep(min(sleep_s, 0.5))
                 raise TimeoutError("update_weights timed out on server")
             return _Resp()
+
+        def close(self):
+            pass
 
     client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
     client._urls = ["http://server-0:8000"]
@@ -1696,9 +1783,73 @@ def test_delta_update_timeout_still_resumes_generation_and_preserves_primary_err
         assert "/pause?mode=keep&clear_cache=false" in seen_endpoints
         assert "/update_weights" in seen_endpoints
         assert "/resume" in seen_endpoints
+        # Unconfirmed /update_weights timeout still blocks a new lifecycle round.
+        with pytest.raises(TimeoutError, match="unconfirmed"):
+            client.start_weight_update()
     finally:
-        client.drain_inflight(deadline_at=time.monotonic() + 2.0)
-        client._pool.shutdown(wait=True)
+        client.close()
+
+
+@pytest.mark.vllm
+def test_delta_partial_pause_failure_still_resumes_all_servers():
+    """If pause_generation succeeds on one server and fails on another, finally must still resume all servers."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+        START_UPDATE_ENDPOINT,
+        SkyrlWeightSyncClient,
+        weight_sync_client_deadline,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.delta.trainer import (
+        DeltaTrainerWeightTransferEngine,
+    )
+
+    seen_calls = []
+
+    class _Resp:
+        def __init__(self, status_code=200, reason="OK", body=None):
+            self.status_code = status_code
+            self.reason = reason
+            self._body = body if body is not None else {"status": "ok"}
+            self.text = str(self._body)
+
+        def json(self):
+            return self._body
+
+    class _PartialPauseSession:
+        def post(self, url, json=None, timeout=None):
+            seen_calls.append(url)
+            if url.startswith("http://server-1:8000/pause"):
+                return _Resp(500, "Internal Server Error", {"detail": "pause failed"})
+            return _Resp()
+
+        def close(self):
+            pass
+
+    client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    client._urls = ["http://server-0:8000", "http://server-1:8000"]
+    client._dp = 1
+    client._init_payload_fn = None
+    client._timeout_s = None
+    client._start_endpoint = START_UPDATE_ENDPOINT
+    client._session = _PartialPauseSession()
+    client._pool = ThreadPoolExecutor(max_workers=2)
+
+    engine = DeltaTrainerWeightTransferEngine.__new__(DeltaTrainerWeightTransferEngine)
+    engine.client = client
+    engine._init_info = SimpleNamespace(sync_dir="/tmp/delta")
+    engine._reset_prefix_cache = False
+    engine.skyrl_draft_source = None
+
+    try:
+        with weight_sync_client_deadline(time.monotonic() + 2.0):
+            with pytest.raises(RuntimeError, match="pause failed"):
+                engine._apply_receiver_update({"target_version": 1, "sync_dir": "/tmp/delta"})
+        assert "http://server-0:8000/resume" in seen_calls
+        assert "http://server-1:8000/resume" in seen_calls
+    finally:
+        client.close()
 
 
 def _worker_skyrl_ipc_trainer_coordinates_failures(rank: int, world_size: int, store_path: str) -> None:
@@ -1856,3 +2007,119 @@ def test_delayed_finish_weight_update_does_not_disarm_newly_armed_tenant():
         assert "tenant-b" in lora_patch.staged_adapter_names()
     finally:
         lora_patch.discard_in_memory_adapter("tenant-b")
+
+
+def _worker_skyrl_nccl_trainer_coordinates_failures(rank: int, world_size: int, store_path: str) -> None:
+    from contextlib import contextmanager
+
+    from vllm.distributed.weight_transfer.base import ParamMeta
+
+    from skyrl.backends.skyrl_train.weight_sync.weight_senders import (
+        get_skyrl_nccl_trainer,
+    )
+
+    _init_gloo_group(rank, world_size, store_path)
+    try:
+        _, engine_cls = get_skyrl_nccl_trainer()
+        engine = engine_cls.__new__(engine_cls)
+        engine.is_sender = rank == 0
+        engine._sent_meta = None
+
+        fail_stage = {"stage": "start"}
+        calls = []
+        iter_counts = {"main": 0, "draft": 0}
+
+        class _CollectiveSource:
+            def __init__(self, tag: str):
+                self._tag = tag
+                self._meta = [ParamMeta(f"{tag}.w0", torch.float32, (2, 2))]
+
+            @property
+            def metadata(self):
+                return self._meta
+
+            def iter_full(self):
+                iter_counts[self._tag] += 1
+                # Real Gloo collective standing in for FSDP/Megatron gather collectives.
+                dist.barrier()
+                yield f"{self._tag}.w0", torch.ones(2, 2)
+
+        class _FakeNCCLClient:
+            def __init__(self):
+                self._in_draft = False
+
+            @contextmanager
+            def draft_session(self):
+                self._in_draft = True
+                try:
+                    yield
+                finally:
+                    self._in_draft = False
+
+            def start_weight_update(self):
+                calls.append("draft_start" if self._in_draft else "start")
+                if not self._in_draft and fail_stage["stage"] == "start":
+                    raise RuntimeError("NCCL start_weight_update failed")
+
+            def update_weights(self, update_info):
+                calls.append(("update", update_info["names"]))
+
+            def finish_weight_update(self):
+                calls.append("draft_finish" if self._in_draft else "finish")
+                if not self._in_draft and fail_stage["stage"] == "finish":
+                    raise RuntimeError("NCCL finish_weight_update failed")
+
+        engine.client = _FakeNCCLClient()
+        engine.source = _CollectiveSource("main")
+        engine.skyrl_draft_source = _CollectiveSource("draft")
+
+        # Drain source.iter_full() on both ranks (like real _broadcast) without needing CUDA NCCL.
+        def _fake_broadcast(source, meta):
+            for _ in source.iter_full():
+                pass
+
+        engine._broadcast = _fake_broadcast
+        engine._post_send_sync = lambda: None
+
+        # 1) Rank 0 fails start_weight_update -> rank 1 must abort BEFORE entering main iter_full() barrier.
+        if rank == 0:
+            with pytest.raises(RuntimeError, match="NCCL start_weight_update failed"):
+                engine.send_weights()
+        else:
+            with pytest.raises(PeerRankSyncError, match="NCCL start_weight_update"):
+                engine.send_weights()
+        assert iter_counts["main"] == 0
+        assert iter_counts["draft"] == 0
+
+        # 2) Rank 0 fails main finish_weight_update -> rank 1 must abort BEFORE entering draft session.
+        fail_stage["stage"] = "finish"
+        if rank == 0:
+            with pytest.raises(RuntimeError, match="NCCL finish_weight_update failed"):
+                engine.send_weights()
+        else:
+            with pytest.raises(PeerRankSyncError, match="NCCL finish_weight_update"):
+                engine.send_weights()
+        assert iter_counts["main"] == 1
+        assert iter_counts["draft"] == 0
+
+        # 3) Full round (main + draft) succeeds on the same Gloo PG.
+        fail_stage["stage"] = None
+        engine.send_weights()
+        assert iter_counts["main"] == 2
+        assert iter_counts["draft"] == 1
+        if rank == 0:
+            assert calls[-6:] == [
+                "start",
+                ("update", ["main.w0"]),
+                "finish",
+                "draft_start",
+                ("update", ["draft.w0"]),
+                "draft_finish",
+            ]
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.vllm
+def test_skyrl_nccl_trainer_coordinates_start_and_finish_failures_on_gloo(tmp_path):
+    _run_mp(_worker_skyrl_nccl_trainer_coordinates_failures, 2, tmp_path)
