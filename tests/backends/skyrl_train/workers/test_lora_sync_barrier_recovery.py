@@ -1637,3 +1637,222 @@ def test_timed_out_blocking_rpc_blocks_reuse_until_settled():
         release_old_post.set()
         client.drain_inflight(deadline_at=time.monotonic() + 2.0)
         client._pool.shutdown(wait=True)
+
+
+@pytest.mark.vllm
+def test_delta_update_timeout_still_resumes_generation_and_preserves_primary_error():
+    """An update_weights timeout inside delta sync must still run resume_generation and preserve the primary error."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+        START_UPDATE_ENDPOINT,
+        SkyrlWeightSyncClient,
+        weight_sync_client_deadline,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.delta.trainer import (
+        DeltaTrainerWeightTransferEngine,
+    )
+
+    seen_endpoints = []
+
+    class _Resp:
+        status_code = 200
+        reason = "OK"
+        text = "{}"
+
+        def json(self):
+            return {"status": "ok"}
+
+    class _DeltaSession:
+        def post(self, url, json=None, timeout=None):
+            endpoint = "/" + url.split("://", 1)[1].split("/", 1)[1]
+            seen_endpoints.append(endpoint)
+            if endpoint == "/update_weights":
+                # Simulate socket timeout exhausting the update budget.
+                time.sleep(min(timeout, 5.0) if timeout is not None else 0.5)
+                raise TimeoutError("update_weights timed out on server")
+            return _Resp()
+
+    client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    client._urls = ["http://server-0:8000"]
+    client._dp = 1
+    client._init_payload_fn = None
+    client._timeout_s = None
+    client._start_endpoint = START_UPDATE_ENDPOINT
+    client._session = _DeltaSession()
+    client._pool = ThreadPoolExecutor(max_workers=1)
+
+    engine = DeltaTrainerWeightTransferEngine.__new__(DeltaTrainerWeightTransferEngine)
+    engine.client = client
+    engine._init_info = SimpleNamespace(sync_dir="/tmp/delta")
+    engine._reset_prefix_cache = False
+    engine.skyrl_draft_source = None
+
+    try:
+        with weight_sync_client_deadline(time.monotonic() + 0.8):
+            with pytest.raises(TimeoutError, match="update_weights"):
+                engine._apply_receiver_update({"target_version": 1, "sync_dir": "/tmp/delta"})
+        assert "/pause?mode=keep&clear_cache=false" in seen_endpoints
+        assert "/update_weights" in seen_endpoints
+        assert "/resume" in seen_endpoints
+    finally:
+        client.drain_inflight(deadline_at=time.monotonic() + 2.0)
+        client._pool.shutdown(wait=True)
+
+
+def _worker_skyrl_ipc_trainer_coordinates_failures(rank: int, world_size: int, store_path: str) -> None:
+    from skyrl.backends.skyrl_train.weight_sync.weight_senders import (
+        get_skyrl_ipc_trainer,
+    )
+
+    _init_gloo_group(rank, world_size, store_path)
+    try:
+        _, engine_cls = get_skyrl_ipc_trainer()
+        engine = engine_cls.__new__(engine_cls)
+        engine.is_sender = rank == 0
+        engine.packed = True
+        engine.skyrl_draft_source = None
+        engine.source = SimpleNamespace()
+        engine._skyrl_send_error = None
+
+        fail_stage = {"stage": "start"}
+        calls = []
+
+        class _FakeIPCClient:
+            def start_weight_update(self):
+                calls.append("start")
+                if fail_stage["stage"] == "start":
+                    raise RuntimeError("IPC start_weight_update failed")
+
+            def update_weights(self, update_info):
+                calls.append(("update", update_info["names"]))
+                if fail_stage["stage"] == "update":
+                    raise RuntimeError("IPC update_weights failed on chunk 1")
+
+            def finish_weight_update(self):
+                calls.append("finish")
+                if fail_stage["stage"] == "finish":
+                    raise RuntimeError("IPC finish_weight_update failed")
+
+        engine.client = _FakeIPCClient()
+
+        # Simulate packed _send with two chunks and a real all_gather_object handle gather per chunk.
+        def _fake_packed_send(source):
+            for idx in range(2):
+                gathered = [None] * world_size
+                dist.all_gather_object(gathered, {f"gpu-{rank}": idx})
+                merged_handles = {k: v for d in gathered for k, v in d.items()}
+                engine._do_send(
+                    names=[f"w{idx}"],
+                    dtype_names=["float32"],
+                    shapes=[[2, 2]],
+                    ipc_handles=merged_handles,
+                    tensor_sizes=[4],
+                )
+                engine._post_send_sync()
+            return None
+
+        engine._send = _fake_packed_send
+
+        # 1) start_weight_update fails on rank 0 -> rank 1 never enters handle all_gather_object.
+        if rank == 0:
+            with pytest.raises(RuntimeError, match="IPC start_weight_update failed"):
+                engine.send_weights()
+        else:
+            with pytest.raises(PeerRankSyncError, match="IPC start_weight_update"):
+                engine.send_weights()
+
+        # 2) update_weights fails on chunk 1 of 2 -> rank 1 exits at chunk 1's _post_send_sync.
+        fail_stage["stage"] = "update"
+        if rank == 0:
+            with pytest.raises(RuntimeError, match="IPC update_weights failed"):
+                engine.send_weights()
+        else:
+            with pytest.raises(PeerRankSyncError, match="IPC update_weights"):
+                engine.send_weights()
+
+        # 3) finish_weight_update fails on rank 0 -> rank 1 exits cleanly without barrier hang.
+        fail_stage["stage"] = "finish"
+        if rank == 0:
+            with pytest.raises(RuntimeError, match="IPC finish_weight_update failed"):
+                engine.send_weights()
+        else:
+            with pytest.raises(PeerRankSyncError, match="IPC finish_weight_update"):
+                engine.send_weights()
+
+        # 4) Full round succeeds on the same Gloo PG.
+        fail_stage["stage"] = None
+        engine.send_weights()
+        if rank == 0:
+            assert calls[-4:] == ["start", ("update", ["w0"]), ("update", ["w1"]), "finish"]
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.vllm
+def test_skyrl_ipc_trainer_coordinates_start_update_finish_failures_on_gloo(tmp_path):
+    _run_mp(_worker_skyrl_ipc_trainer_coordinates_failures, 2, tmp_path)
+
+
+@pytest.mark.vllm
+def test_delayed_finish_weight_update_does_not_disarm_newly_armed_tenant():
+    """A delayed finish_weight_update from an earlier timed-out round must not disarm a newly armed tenant."""
+    from skyrl.backends.skyrl_train.patches.vllm import (
+        patch_lora_in_memory as lora_patch,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.lora_target import (
+        build_lora_receive_target,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.weight_receivers import (
+        SkyrlReceiveLifecycleMixin,
+    )
+
+    class _BaseEngine:
+        def __init__(self):
+            self.device = torch.device("cpu")
+            self.vllm_config = SimpleNamespace(lora_config=object())
+            self.model = SimpleNamespace(load_weights=lambda weights: set())
+
+        def start_weight_update(self):
+            pass
+
+        def receive_weights(self, update_info):
+            self.model.load_weights([("base_model.model.q_proj.lora_A.weight", torch.ones(2, 2))])
+
+        def finish_weight_update(self):
+            pass
+
+    class _Receiver(SkyrlReceiveLifecycleMixin, _BaseEngine):
+        pass
+
+    receiver = _Receiver()
+    # Tenant A arms and starts, then times out before finish completes; rollback disarms round r1.
+    target_a = {**build_lora_receive_target("tenant-a", {}, {}), "round_id": "r1"}
+    receiver.skyrl_set_lora_receive_target(target_a)
+    receiver.start_weight_update()
+    receiver.receive_weights(None)
+    receiver.skyrl_clear_lora_receive_target(round_id="r1")
+    assert receiver.skyrl_lora_armed() is False
+
+    # Tenant B arms with round r2 (start_weight_update has not run yet).
+    target_b = {**build_lora_receive_target("tenant-b", {}, {}), "round_id": "r2"}
+    receiver.skyrl_set_lora_receive_target(target_b)
+    assert receiver.skyrl_lora_armed() is True
+
+    # Tenant A's delayed finish_weight_update now arrives on the server.
+    # It must fail without disarming Tenant B.
+    with pytest.raises(RuntimeError, match="before start_weight_update"):
+        receiver.finish_weight_update()
+    assert receiver.skyrl_lora_armed() is True
+    assert receiver._skyrl_lora_target["lora_name"] == "tenant-b"
+
+    # Tenant B's own full round now completes cleanly.
+    try:
+        receiver.start_weight_update()
+        receiver.receive_weights(None)
+        receiver.finish_weight_update()
+        assert receiver.skyrl_lora_armed() is False
+        assert "tenant-b" in lora_patch.staged_adapter_names()
+    finally:
+        lora_patch.discard_in_memory_adapter("tenant-b")

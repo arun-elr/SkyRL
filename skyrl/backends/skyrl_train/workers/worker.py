@@ -752,6 +752,10 @@ class Worker(DistributedTorchRayActor):
             ):
                 try:
                     await self._await_weight_sync_thread(engine.send_weights)
+                except PeerRankSyncError:
+                    # Peer rank failed inside coordinated send_weights; enter the
+                    # trailing barrier with local_error=None to stay in lockstep.
+                    pass
                 except (Exception, asyncio.CancelledError) as exc:
                     sync_error = exc
 

@@ -130,18 +130,92 @@ def _build_skyrl_nccl_trainer() -> "tuple[type, type]":
 
 
 def _build_skyrl_ipc_trainer() -> "tuple[type, type]":
-    """vLLM's IPC trainer engine plus the SkyRL capability declarations."""
+    """vLLM's IPC trainer engine plus the SkyRL capability declarations and error coordination."""
+    import torch
     from vllm.distributed.weight_transfer.ipc_engine import (
         IPCTrainerInitInfo,
         IPCTrainerWeightTransferEngine,
+    )
+
+    from skyrl.backends.skyrl_train.workers.worker_utils import (
+        barrier_with_error_propagation,
     )
 
     @dataclass
     class SkyrlIPCTrainerInitInfo(IPCTrainerInitInfo):
         backend: ClassVar[str] = SKYRL_IPC_TRAINER_BACKEND
 
+    class _SkyrlCoordinatedIPCSendMixin:
+        """Keep all trainer ranks aligned across IPC's start / update / finish RPCs.
+
+        Upstream ``IPCTrainerWeightTransferEngine.send_weights`` calls rank-0
+        ``start_weight_update`` before the handle ``all_gather_object``, calls
+        rank-0 ``update_weights`` before each per-chunk barrier, and calls rank-0
+        ``finish_weight_update`` before ``_post_send_sync``'s barrier. Coordinating
+        rank-0 RPC failures at each boundary ensures peer ranks never diverge into
+        incompatible collectives or time out in ``barrier()``.
+        """
+
+        _skyrl_send_error: Optional[BaseException] = None
+
+        def _do_send(self, *args, **kwargs) -> None:
+            if not self.is_sender:
+                return
+            try:
+                super()._do_send(*args, **kwargs)
+            except Exception as exc:
+                # Defer raising until the immediately following sync barrier
+                # (_post_send_sync in packed mode, or send_weights in unpacked mode).
+                self._skyrl_send_error = exc
+
+        def _post_send_sync(self) -> None:
+            err = self._skyrl_send_error
+            self._skyrl_send_error = None
+            try:
+                barrier_with_error_propagation(err, stage="IPC update_weights")
+            finally:
+                if torch.cuda.is_available():
+                    torch.cuda.ipc_collect()
+
+        def send_weights(self) -> None:
+            assert self.source is not None
+            source = self.source
+            self._skyrl_send_error = None
+
+            start_error: Optional[BaseException] = None
+            if self.is_sender:
+                try:
+                    self.client.start_weight_update()
+                except Exception as exc:
+                    start_error = exc
+            # Coordinate start_weight_update BEFORE any rank enters _send()'s handle all_gather.
+            barrier_with_error_propagation(start_error, stage="IPC start_weight_update")
+
+            weight_refs = None
+            try:
+                weight_refs = self._send(source)
+                # In unpacked mode, _do_send deferred any error without calling _post_send_sync.
+                update_error = self._skyrl_send_error
+                self._skyrl_send_error = None
+                barrier_with_error_propagation(update_error, stage="IPC update_weights")
+
+                finish_error: Optional[BaseException] = None
+                if self.is_sender:
+                    try:
+                        self.client.finish_weight_update()
+                    except Exception as exc:
+                        finish_error = exc
+                barrier_with_error_propagation(finish_error, stage="IPC finish_weight_update")
+            finally:
+                if torch.cuda.is_available():
+                    torch.cuda.ipc_collect()
+                del weight_refs
+
     class SkyrlIPCTrainerWeightTransferEngine(
-        SkyrlDraftSessionMixin, SkyrlTrainerCapabilities, IPCTrainerWeightTransferEngine
+        SkyrlDraftSessionMixin,
+        SkyrlTrainerCapabilities,
+        _SkyrlCoordinatedIPCSendMixin,
+        IPCTrainerWeightTransferEngine,
     ):
         init_info_cls = SkyrlIPCTrainerInitInfo
 

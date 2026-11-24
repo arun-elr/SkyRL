@@ -271,11 +271,21 @@ class SkyrlLoraStagingMixin:
 
         target = self._skyrl_lora_target
         staged = self._skyrl_lora_staged
+        if target is None:
+            self._skyrl_lora_staged = None
+            raise RuntimeError("skyrl_finish_lora_update called without an armed LoRA receive target.")
+        if staged is None:
+            # Armed, but start_weight_update() has not run for this target yet
+            # (e.g. a delayed finish_weight_update() from an earlier timed-out
+            # round arrived after a new tenant armed). Keep the newly armed
+            # target intact instead of disarming it.
+            raise RuntimeError(
+                f"skyrl_finish_lora_update called for {target['lora_name']!r} before start_weight_update; "
+                "leaving armed target intact."
+            )
         # Disarm before the work: one round per arm, even if this raises.
         self._skyrl_lora_target = None
         self._skyrl_lora_staged = None
-        if target is None:
-            raise RuntimeError("skyrl_finish_lora_update called without an armed LoRA receive target.")
         if not staged:
             raise RuntimeError(f"LoRA weight update for {target['lora_name']!r} finished without receiving any tensors")
         tensors = expand_lora_aliases(staged, target.get("aliases") or {})

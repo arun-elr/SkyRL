@@ -2117,6 +2117,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             ):
                 try:
                     await self._await_weight_sync_thread(engine.send_weights)
+                except PeerRankSyncError:
+                    # A peer (e.g. rank-0 IPC sender) already failed; keep send_error=None
+                    # so exchange_rank_errors below propagates only the failing rank's error.
+                    pass
                 except (Exception, asyncio.CancelledError) as exc:
                     send_error = exc
         finally:

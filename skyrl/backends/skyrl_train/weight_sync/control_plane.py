@@ -33,6 +33,7 @@ import time
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from concurrent.futures import wait as futures_wait
 from contextlib import contextmanager
 from typing import (
     TYPE_CHECKING,
@@ -86,9 +87,14 @@ def weight_sync_client_timeout(timeout_s: Optional[float]) -> Iterator[None]:
         yield
 
 
-def _current_process_deadline() -> Optional[float]:
+def current_weight_sync_deadline() -> Optional[float]:
+    """Return the active process-local weight-sync monotonic deadline, if any."""
     with _CONTROL_PLANE_LOCK:
         return _WEIGHT_SYNC_DEADLINE_STACK[-1] if _WEIGHT_SYNC_DEADLINE_STACK else None
+
+
+def _current_process_deadline() -> Optional[float]:
+    return current_weight_sync_deadline()
 
 
 def drain_inflight_weight_sync_requests(deadline_at: Optional[float] = None) -> List[str]:
@@ -273,23 +279,34 @@ class SkyrlWeightSyncClient:
             self._inflight_entries().clear()
 
         still_running: List[Tuple[str, str, Future]] = []
+        active: List[Tuple[str, str, Future]] = []
         for url, endpoint, fut in pending:
             if fut.done():
                 try:
                     fut.result()
                 except Exception:  # noqa: BLE001
                     pass
-                continue
+            else:
+                active.append((url, endpoint, fut))
+
+        if active:
             remaining = None if deadline_at is None else max(0.0, deadline_at - time.monotonic())
             if remaining is not None and remaining <= 0.0:
-                still_running.append((url, endpoint, fut))
-                continue
-            try:
-                fut.result(timeout=remaining)
-            except FuturesTimeoutError:
-                still_running.append((url, endpoint, fut))
-            except Exception:  # noqa: BLE001
-                pass
+                still_running = active
+            else:
+                # Use futures_wait rather than fut.result(timeout=...) because in
+                # Python 3.11+ concurrent.futures.TimeoutError is builtin
+                # TimeoutError, so a completed future that raised TimeoutError
+                # (e.g. socket.timeout) would be mistaken for a wait timeout.
+                done_futs, _ = futures_wait([fut for _, _, fut in active], timeout=remaining)
+                for url, endpoint, fut in active:
+                    if fut in done_futs or fut.done():
+                        try:
+                            fut.result()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    else:
+                        still_running.append((url, endpoint, fut))
 
         if still_running:
             with _CONTROL_PLANE_LOCK:
@@ -334,11 +351,16 @@ class SkyrlWeightSyncClient:
             try:
                 remaining = None if deadline_at is None else max(0.0, deadline_at - time.monotonic())
                 responses.append(fut.result(timeout=remaining))
-            except FuturesTimeoutError:
-                fut.cancel()
-                if not fut.done():
-                    timed_out.append((url, endpoint, fut))
-                first_exc = first_exc or TimeoutError(f"POST {url}{endpoint} exceeded weight-sync phase deadline")
+            except FuturesTimeoutError as exc:
+                if fut.done():
+                    # The request itself finished with a TimeoutError (e.g. socket.timeout);
+                    # it is settled, so do not record it as still in flight.
+                    first_exc = first_exc or exc
+                else:
+                    fut.cancel()
+                    if not fut.done():
+                        timed_out.append((url, endpoint, fut))
+                    first_exc = first_exc or TimeoutError(f"POST {url}{endpoint} exceeded weight-sync phase deadline")
             except Exception as exc:  # noqa: BLE001
                 first_exc = first_exc or exc
         if timed_out:
