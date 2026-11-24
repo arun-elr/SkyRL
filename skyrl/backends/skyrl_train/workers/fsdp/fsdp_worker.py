@@ -180,6 +180,8 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         sync_error: Optional[BaseException] = None
         if torch.distributed.get_rank() == 0:
             try:
+                import time
+
                 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
                     RemoteInferenceClient,
                     control_plane_timeout_budget,
@@ -188,6 +190,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 )
 
                 phase_budget = rank0_phase_timeout_s()
+                phase_deadline = time.monotonic() + phase_budget if phase_budget > 0 else None
                 unresolved_loads = await drain_client_pending_lora_loads(
                     inference_engine_client, timeout_s=phase_budget
                 )
@@ -209,8 +212,11 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 with io.open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
                     json.dump(peft_config, f, ensure_ascii=False, indent=4)
 
-                # Send LoRA disk loading request to inference engine.
-                with control_plane_timeout_budget(phase_budget):
+                # Send LoRA disk loading request within the remaining single phase budget.
+                load_budget = (
+                    max(0.05, phase_deadline - time.monotonic()) if phase_deadline is not None else phase_budget
+                )
+                with control_plane_timeout_budget(load_budget):
                     if isinstance(inference_engine_client, RemoteInferenceClient):
                         await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
                     else:
