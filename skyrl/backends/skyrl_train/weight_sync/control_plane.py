@@ -356,12 +356,40 @@ class SkyrlWeightSyncClient:
             raise resume_exc
 
     def close(self) -> None:
-        """Release the HTTP session + fan-out pool. Idempotent."""
+        """Release the HTTP session + fan-out pool. Idempotent.
+
+        Closes the HTTP session first so any socket waiting on a hung server is
+        aborted rather than blocking teardown forever. If requests remain
+        unresolved after a short drain, returns without hanging in
+        ``_pool.shutdown(wait=True)`` and keeps the client registered in
+        ``_ACTIVE_CLIENTS`` until those requests settle.
+        """
         self._closed = True
+        self._prune_done_inflight()
         with _CONTROL_PLANE_LOCK:
-            _ACTIVE_CLIENTS.discard(self)
-        self._pool.shutdown(wait=True)
-        self._session.close()
+            has_inflight = bool(self._inflight_entries())
+            has_unconfirmed = bool(self._unconfirmed_entries())
+
+        try:
+            self._session.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+        if has_inflight:
+            self.drain_inflight(deadline_at=time.monotonic() + 0.5, include_unconfirmed=False)
+            self._prune_done_inflight()
+            with _CONTROL_PLANE_LOCK:
+                still_inflight = bool(self._inflight_entries())
+                still_unconfirmed = bool(self._unconfirmed_entries())
+            self._pool.shutdown(wait=not still_inflight, cancel_futures=True)
+            if not still_inflight and not still_unconfirmed:
+                with _CONTROL_PLANE_LOCK:
+                    _ACTIVE_CLIENTS.discard(self)
+        else:
+            self._pool.shutdown(wait=True)
+            if not has_unconfirmed:
+                with _CONTROL_PLANE_LOCK:
+                    _ACTIVE_CLIENTS.discard(self)
 
     # ---- internals ----
 
@@ -398,26 +426,28 @@ class SkyrlWeightSyncClient:
                 unconfirmed.append(entry)
 
     def _prune_done_inflight(self) -> List[Tuple[str, str, Future]]:
-        """Remove and finalize only completed futures; keep unfinished futures visible in the registry."""
-        done_entries: List[Tuple[str, str, Future]] = []
+        """Atomically remove completed futures and record any unconfirmed failures under the lock."""
         active: List[Tuple[str, str, Future]] = []
         with _CONTROL_PLANE_LOCK:
             remaining_entries: List[Tuple[str, str, Future]] = []
             for entry in self._inflight_entries():
-                _, _, fut = entry
+                url, endpoint, fut = entry
                 if fut.done():
-                    done_entries.append(entry)
+                    try:
+                        fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        if _is_stateful_endpoint(endpoint) and _is_unconfirmed_lifecycle_error(exc):
+                            reason = f"unconfirmed {type(exc).__name__}"
+                            unconfirmed_entry = f"{url}{endpoint} ({reason})"
+                            unconfirmed = self._unconfirmed_entries()
+                            if unconfirmed_entry not in unconfirmed:
+                                unconfirmed.append(unconfirmed_entry)
                 else:
                     remaining_entries.append(entry)
                     active.append(entry)
             self._inflight_entries()[:] = remaining_entries
-
-        for url, endpoint, fut in done_entries:
-            try:
-                fut.result()
-            except Exception as exc:  # noqa: BLE001
-                if _is_stateful_endpoint(endpoint) and _is_unconfirmed_lifecycle_error(exc):
-                    self._record_unconfirmed_lifecycle(url, endpoint, exc)
+            if getattr(self, "_closed", False) and not remaining_entries and not self._unconfirmed_entries():
+                _ACTIVE_CLIENTS.discard(self)
         return active
 
     def _schedule_deferred_resume(self, url: str, fut: Future) -> None:

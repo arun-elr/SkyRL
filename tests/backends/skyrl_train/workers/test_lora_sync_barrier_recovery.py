@@ -34,6 +34,18 @@ from skyrl.backends.skyrl_train.workers.worker_utils import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_control_plane_registry():
+    """Keep process-local _ACTIVE_CLIENTS isolated between tests."""
+    from skyrl.backends.skyrl_train.weight_sync import control_plane
+
+    with control_plane._CONTROL_PLANE_LOCK:
+        control_plane._ACTIVE_CLIENTS.clear()
+    yield
+    with control_plane._CONTROL_PLANE_LOCK:
+        control_plane._ACTIVE_CLIENTS.clear()
+
+
 class _FakeTaskType(Enum):
     CAUSAL_LM = "CAUSAL_LM"
 
@@ -1583,6 +1595,7 @@ def _worker_shared_deadline_bounds_combined_sequential_rpcs(rank: int, world_siz
             barrier_with_error_propagation(None, stage="shared deadline recovery")
         finally:
             client.close()
+            del client
     finally:
         dist.destroy_process_group()
 
@@ -1717,6 +1730,7 @@ def test_read_timeout_on_lifecycle_rpc_blocks_subsequent_round_without_server_co
             assert len(calls) == calls_before
         finally:
             client.close()
+            del client
 
     # Pre-connect failures and HTTP status RuntimeErrors are NOT unconfirmed.
     assert _is_unconfirmed_lifecycle_error(ConnectionRefusedError("refused")) is False
@@ -1817,6 +1831,69 @@ def test_inflight_drain_cancellation_keeps_unfinished_request_visible():
         client.close()
 
 
+def test_close_does_not_hang_with_stuck_inflight_rpc_and_preserves_tracking():
+    """close() must not hang indefinitely on a stuck stateful RPC and must keep it visible in global draining until settled."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+        START_UPDATE_ENDPOINT,
+        SkyrlWeightSyncClient,
+        drain_inflight_weight_sync_requests,
+        weight_sync_client_deadline,
+    )
+
+    release_rpc = threading.Event()
+    session_closed = threading.Event()
+
+    class _Resp:
+        status_code = 200
+        reason = "OK"
+        text = "{}"
+
+    class _StuckIgnoreCloseSession:
+        def post(self, url, json=None, timeout=None):
+            release_rpc.wait(timeout=10.0)
+            return _Resp()
+
+        def close(self):
+            session_closed.set()
+
+    client = SkyrlWeightSyncClient.__new__(SkyrlWeightSyncClient)
+    client._urls = ["http://server-0:8000"]
+    client._dp = 1
+    client._init_payload_fn = None
+    client._timeout_s = None
+    client._start_endpoint = START_UPDATE_ENDPOINT
+    client._session = _StuckIgnoreCloseSession()
+    client._pool = ThreadPoolExecutor(max_workers=1)
+
+    try:
+        with weight_sync_client_deadline(time.monotonic() + 0.1):
+            with pytest.raises(TimeoutError, match="exceeded weight-sync phase deadline"):
+                client.finish_weight_update()
+
+        t0 = time.monotonic()
+        client.close()
+        elapsed = time.monotonic() - t0
+        assert session_closed.is_set()
+        # Must return after bounded drain instead of hanging 10s in _pool.shutdown(wait=True).
+        assert elapsed < 2.0
+        # Unresolved request must remain visible to global draining.
+        assert "http://server-0:8000/finish_weight_update" in drain_inflight_weight_sync_requests(
+            deadline_at=time.monotonic()
+        )
+
+        # Once the stuck thread finally settles, global draining clears it.
+        release_rpc.set()
+        assert drain_inflight_weight_sync_requests(deadline_at=time.monotonic() + 2.0) == []
+    finally:
+        release_rpc.set()
+        client.drain_inflight(deadline_at=time.monotonic() + 2.0)
+        client.close()
+
+
 def test_pause_endpoint_tracks_unconfirmed_transport_errors_and_deadline_race():
     """Query-bearing /pause uses connect-only timeout and tracks ambiguous transport errors; successful deadline races stay clean."""
     import threading
@@ -1866,6 +1943,11 @@ def test_pause_endpoint_tracks_unconfirmed_transport_errors_and_deadline_race():
         assert any("/pause" in entry and "unconfirmed" in entry for entry in unconfirmed)
     finally:
         client.close()
+        del client
+        from skyrl.backends.skyrl_train.weight_sync import control_plane
+
+        with control_plane._CONTROL_PLANE_LOCK:
+            control_plane._ACTIVE_CLIENTS.clear()
 
     # Successful RPC finishing right as the deadline expires must NOT be marked unconfirmed.
     mode["fail_pause"] = False
