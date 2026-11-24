@@ -436,6 +436,19 @@ def has_packed_hf_expert_mappings(bridge) -> bool:
     return bool(_packed_hf_expert_module_patterns(bridge))
 
 
+_REGEX_META_CHARS = frozenset(r"[](){}|+?^$\ ")
+
+
+def _pattern_has_unbounded_regex(pattern: str) -> bool:
+    """Whether ``pattern`` uses regex syntax beyond plain module names and ``*`` wildcards.
+
+    Megatron-Bridge's ``wildcard_match`` compiles ``"^" + pattern.replace("*", "(.*)") + "$"``
+    without escaping regex metacharacters, so character classes, quantifiers, alternation, or
+    unescaped ``..`` can match arbitrary layer/expert indices not present as literal digits.
+    """
+    return ".." in pattern or any(ch in _REGEX_META_CHARS for ch in pattern)
+
+
 def _instantiate_module_candidates(mod_pattern: str, index_hints: Iterable[str]) -> List[str]:
     """Instantiate wildcard module patterns using layer/expert index hints (always including 0 and 1)."""
     indices = sorted({"0", "1", *index_hints})
@@ -456,7 +469,11 @@ def _instantiate_module_candidates(mod_pattern: str, index_hints: Iterable[str])
 
 
 def peft_targets_routed_experts(peft_config, module_patterns: Optional[Iterable[str]] = None) -> bool:
-    """Whether ``peft_config`` matches any routed-expert module under Megatron-Bridge's matcher rules."""
+    """Whether ``peft_config`` may match any routed-expert module under Megatron-Bridge's matcher rules.
+
+    Conservatively returns ``True`` for patterns whose regex syntax could match routed experts at
+    indices not enumerated as literals (e.g. ``*.layers.[2-9][0-9].mlp.experts.linear_fc1``).
+    """
     from megatron.bridge.peft.utils import wildcard_match
 
     canonical = getattr(peft_config, "canonical_mapping", None)
@@ -492,6 +509,8 @@ def peft_targets_routed_experts(peft_config, module_patterns: Optional[Iterable[
                 continue
             if pattern.lower() == "all-linear":
                 return True
+            if _pattern_has_unbounded_regex(pattern):
+                return True
             for full_name in candidates:
                 leaf = full_name.rsplit(".", 1)[-1]
                 if leaf == pattern or wildcard_match(pattern, full_name):
@@ -499,9 +518,15 @@ def peft_targets_routed_experts(peft_config, module_patterns: Optional[Iterable[
         return False
 
     # Empty/None target_modules: Bridge adapts every linear not matched by exclude_modules.
+    # Only treat routed experts as excluded when pure non-layer-specific exclusions cover every candidate.
+    safe_excludes = [
+        ex
+        for ex in excludes
+        if isinstance(ex, str) and not _pattern_has_unbounded_regex(ex) and not re.search(r"\d", ex)
+    ]
     for full_name in candidates:
         leaf = full_name.rsplit(".", 1)[-1]
-        if leaf not in excludes and not any(isinstance(ex, str) and wildcard_match(ex, full_name) for ex in excludes):
+        if leaf not in safe_excludes and not any(wildcard_match(ex, full_name) for ex in safe_excludes):
             return True
     return False
 

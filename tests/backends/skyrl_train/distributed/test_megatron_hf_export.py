@@ -627,6 +627,7 @@ def test_packed_experts_allow_shared_outer_adapter_export_when_experts_not_targe
     [
         pytest.param(["*.linear_fc*"], id="wildcard_linear_fc"),
         pytest.param(["*.layers.3.mlp.experts.linear_fc1"], id="layer_specific_expert"),
+        pytest.param(["*.layers.[2-9][0-9].mlp.experts.linear_fc1"], id="regex_layer_range_expert"),
         pytest.param(["*.experts.*"], id="wildcard_experts"),
     ],
 )
