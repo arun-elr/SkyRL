@@ -20,11 +20,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import logging
 import math
 import os
 import re
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -388,23 +389,15 @@ def _substitute_expert_wildcard(pattern: str, expert_idx: int) -> Optional[str]:
     return None
 
 
-def has_packed_hf_expert_mappings(bridge) -> bool:
-    """Whether ``bridge`` maps multiple Megatron routed experts onto one packed HF tensor.
-
-    For checkpoints with packed HF expert weights (e.g. ``experts.gate_up_proj`` /
-    ``experts.down_proj`` on Qwen3.5/3.6 MoE), different Megatron expert indices
-    (``.weight0`` vs ``.weight1``) resolve to the same HF parameter name. Pinned
-    Megatron-Bridge's ``save_hf_adapter`` with shared-outer MoE LoRA emits each
-    expert's 2D slice under that shared HF name, so PEFT dict conversion overwrites
-    all earlier experts (under ``expand_shared_outer=True``) or fails partner
-    validation (under ``allow_serving_layout=True``).
-    """
+def _packed_hf_expert_module_patterns(bridge) -> List[str]:
+    """Return Megatron module-name patterns whose routed experts collapse onto one packed HF tensor."""
     model_bridge = getattr(bridge, "_model_bridge", None)
     if model_bridge is None or not hasattr(model_bridge, "mapping_registry"):
-        return False
+        return []
     if hasattr(bridge, "hf_pretrained"):
         model_bridge.hf_pretrained = bridge.hf_pretrained
     registry = model_bridge.mapping_registry()
+    patterns: List[str] = []
     for mapping in getattr(registry, "mappings", ()):
         mp = getattr(mapping, "megatron_param", "")
         if not isinstance(mp, str):
@@ -418,53 +411,115 @@ def has_packed_hf_expert_mappings(bridge) -> bool:
         if m0 is None or m1 is None:
             continue
         if _resolve_hf_param_names(m0) & _resolve_hf_param_names(m1):
-            return True
-    return False
+            if mp.endswith(".weight*"):
+                mod_pattern = mp[: -len(".weight*")]
+            elif mp.endswith(".weight"):
+                mod_pattern = mp[: -len(".weight")]
+            else:
+                mod_pattern = mp
+            if mod_pattern not in patterns:
+                patterns.append(mod_pattern)
+    return patterns
 
 
-_MEGATRON_ROUTED_EXPERT_LEAVES = frozenset({"linear_fc1", "linear_fc2"})
+def has_packed_hf_expert_mappings(bridge) -> bool:
+    """Whether ``bridge`` maps multiple Megatron routed experts onto one packed HF tensor.
+
+    For checkpoints with packed HF expert weights (e.g. ``experts.gate_up_proj`` /
+    ``experts.down_proj`` on Qwen3.5/3.6 MoE), different Megatron expert indices
+    (``.weight0`` vs ``.weight1``) resolve to the same HF parameter name. Pinned
+    Megatron-Bridge's ``save_hf_adapter`` with shared-outer MoE LoRA emits each
+    expert's 2D slice under that shared HF name, so PEFT dict conversion overwrites
+    all earlier experts (under ``expand_shared_outer=True``) or fails partner
+    validation (under ``allow_serving_layout=True``).
+    """
+    return bool(_packed_hf_expert_module_patterns(bridge))
 
 
-def peft_targets_routed_experts(peft_config) -> bool:
-    """Whether ``peft_config`` targets Megatron routed-expert linears (``linear_fc1`` / ``linear_fc2``)."""
-    targets = getattr(peft_config, "target_modules", None)
-    if targets is None:
-        return True
+def _instantiate_module_candidates(mod_pattern: str, index_hints: Iterable[str]) -> List[str]:
+    """Instantiate wildcard module patterns using layer/expert index hints (always including 0 and 1)."""
+    indices = sorted({"0", "1", *index_hints})
+    parts = mod_pattern.replace("**", "*").split("*")
+    num_wildcards = len(parts) - 1
+    if num_wildcards == 0:
+        return [mod_pattern]
+    if num_wildcards <= 2 and len(indices) <= 16:
+        combos = itertools.product(indices, repeat=num_wildcards)
+    else:
+        combos = ((idx,) * num_wildcards for idx in indices)
+    candidates: List[str] = []
+    for combo in combos:
+        candidate = "".join(part + val for part, val in zip(parts, combo)) + parts[-1]
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def peft_targets_routed_experts(peft_config, module_patterns: Optional[Iterable[str]] = None) -> bool:
+    """Whether ``peft_config`` matches any routed-expert module under Megatron-Bridge's matcher rules."""
+    from megatron.bridge.peft.utils import wildcard_match
+
+    canonical = getattr(peft_config, "canonical_mapping", None)
+    targets = list(canonical.keys()) if canonical else getattr(peft_config, "target_modules", None)
     if isinstance(targets, str):
         targets = [targets]
     excludes = getattr(peft_config, "exclude_modules", None) or ()
     if isinstance(excludes, str):
         excludes = [excludes]
-    exclude_set = set(excludes)
-    if any(ex in ("experts", "*.experts.*", "mlp.experts") or ex.endswith(".experts") for ex in exclude_set):
+
+    patterns = (
+        list(module_patterns)
+        if module_patterns is not None
+        else [
+            "decoder.layers.*.mlp.experts.linear_fc1",
+            "decoder.layers.*.mlp.experts.linear_fc2",
+            "decoder.layers.*.mlp.experts.local_experts.*.linear_fc1",
+            "decoder.layers.*.mlp.experts.local_experts.*.linear_fc2",
+        ]
+    )
+    if not patterns:
         return False
-    for target in targets:
-        if not isinstance(target, str):
-            continue
-        if target.lower() == "all-linear":
-            return True
-        if ".experts." in target or target.startswith("experts."):
-            return True
-        leaf = target.rsplit(".", 1)[-1]
-        if leaf in _MEGATRON_ROUTED_EXPERT_LEAVES and target not in exclude_set and leaf not in exclude_set:
-            if "shared_experts" in target or "vision_model" in target:
+
+    hint_sources = list(targets or ()) + list(excludes)
+    index_hints = {m for s in hint_sources if isinstance(s, str) for m in re.findall(r"\d+", s)}
+    candidates = [
+        full_name for mod_pattern in patterns for full_name in _instantiate_module_candidates(mod_pattern, index_hints)
+    ]
+
+    if targets:
+        for pattern in targets:
+            if not isinstance(pattern, str):
                 continue
+            if pattern.lower() == "all-linear":
+                return True
+            for full_name in candidates:
+                leaf = full_name.rsplit(".", 1)[-1]
+                if leaf == pattern or wildcard_match(pattern, full_name):
+                    return True
+        return False
+
+    # Empty/None target_modules: Bridge adapts every linear not matched by exclude_modules.
+    for full_name in candidates:
+        leaf = full_name.rsplit(".", 1)[-1]
+        if leaf not in excludes and not any(isinstance(ex, str) and wildcard_match(ex, full_name) for ex in excludes):
             return True
     return False
 
 
 def validate_shared_outer_adapter_export_supported(bridge, peft_config=None) -> None:
     """Reject shared-outer LoRA HF adapter export on bridges with packed HF expert weights."""
-    if peft_config is not None and not peft_targets_routed_experts(peft_config):
+    packed_patterns = _packed_hf_expert_module_patterns(bridge)
+    if not packed_patterns:
         return
-    if has_packed_hf_expert_mappings(bridge):
-        raise ValueError(
-            "LoRA adapter HF export (`hf_export_config.lora_export_format` in ('adapter', 'both')) "
-            "with `experts_shared_outer_loras=True` is not supported for checkpoints with packed HF "
-            "expert weights (e.g. `experts.gate_up_proj` / `experts.down_proj`): Megatron-Bridge's "
-            "`save_hf_adapter` emits each expert under the same HF key and drops earlier experts. "
-            "Use `lora_export_format='merged'` or disable `experts_shared_outer_loras`."
-        )
+    if peft_config is not None and not peft_targets_routed_experts(peft_config, packed_patterns):
+        return
+    raise ValueError(
+        "LoRA adapter HF export (`hf_export_config.lora_export_format` in ('adapter', 'both')) "
+        "with `experts_shared_outer_loras=True` is not supported for checkpoints with packed HF "
+        "expert weights (e.g. `experts.gate_up_proj` / `experts.down_proj`): Megatron-Bridge's "
+        "`save_hf_adapter` emits each expert under the same HF key and drops earlier experts. "
+        "Use `lora_export_format='merged'` or disable `experts_shared_outer_loras`."
+    )
 
 
 @torch.no_grad()

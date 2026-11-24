@@ -620,3 +620,54 @@ def test_packed_experts_allow_shared_outer_adapter_export_when_experts_not_targe
         expand_shared_outer=True,
     )
     save_adapter.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "target_modules",
+    [
+        pytest.param(["*.linear_fc*"], id="wildcard_linear_fc"),
+        pytest.param(["*.layers.3.mlp.experts.linear_fc1"], id="layer_specific_expert"),
+        pytest.param(["*.experts.*"], id="wildcard_experts"),
+    ],
+)
+def test_packed_experts_reject_wildcard_targets_matching_routed_experts(tmp_path, monkeypatch, target_modules):
+    """Wildcard patterns matching routed experts must be rejected at both configure_lora and save_hf_model."""
+    from skyrl.train.config import SkyRLLoraConfig, SkyRLTrainConfig
+
+    monkeypatch.setattr(worker_mod, "apply_packed_per_expert_sharded_state_dict_patch", Mock())
+    barrier = Mock()
+    monkeypatch.setattr(strategy_mod.dist, "barrier", barrier)
+    cfg = SkyRLTrainConfig().trainer
+    cfg.strategy = "megatron"
+    cfg.policy.model.lora = SkyRLLoraConfig(rank=8, alpha=8, target_modules=target_modules)
+    cfg.policy.megatron_config.lora_config.experts_shared_outer_loras = True
+    cfg.policy.megatron_config.hf_export_config.lora_export_format = "adapter"
+    cfg.policy.megatron_config.hf_export_config.expand_shared_outer = True
+
+    bridge, save_adapter, save_weights = _make_bridge_with_registry(_packed_expert_registry())
+    worker = worker_mod.MegatronPolicyWorkerBase.__new__(worker_mod.MegatronPolicyWorkerBase)
+    worker.cfg = cfg
+    worker.megatron_config = cfg.policy.megatron_config
+    worker.bridge = bridge
+    worker.provider = SimpleNamespace(num_moe_experts=4, vision_config=None, multi_latent_attention=False)
+    worker.is_vlm = False
+    worker._rank = 0
+
+    with pytest.raises(ValueError, match="packed HF expert weights"):
+        worker.configure_lora(cfg.policy.model.lora, lora_type="lora", experts_shared_outer_loras=True)
+
+    owner = _make_strategy(is_lora=True, is_rank_0=True)
+    peft_config = SkyRLLoRA(dim=8, alpha=8, target_modules=target_modules, experts_shared_outer_loras=True)
+    with pytest.raises(ValueError, match="packed HF expert weights"):
+        owner.save_hf_model(
+            bridge,
+            SimpleNamespace(actor_module=["chunk0"]),
+            str(tmp_path / "wildcard_packed"),
+            lora_export_format="adapter",
+            peft_config=peft_config,
+            expand_shared_outer=True,
+        )
+
+    save_adapter.assert_not_called()
+    save_weights.assert_not_called()
+    barrier.assert_not_called()
